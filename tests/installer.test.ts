@@ -6,7 +6,6 @@ import { install } from "../installer/src/install.ts";
 import { DirSink, NodeFileSource } from "../installer/src/node.ts";
 
 const ISO_CANDIDATES = [
-  "/home/hammad/repos/detective-barbie-web-port/DETECTV1_1.ISO",
   "DETECTV1_1.ISO",
 ];
 

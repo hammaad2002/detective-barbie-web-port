@@ -81,7 +81,7 @@ SCENES.push(
 );
 
 function resolveIso(path) {
-  const candidates = [path, join(ROOT, path), join("/home/hammad/repos/detective-barbie-web-port", path)];
+  const candidates = [path, join(ROOT, path)];
   for (const c of candidates) if (existsSync(c)) return resolve(c);
   throw new Error(`disc image not found: ${path}`);
 }

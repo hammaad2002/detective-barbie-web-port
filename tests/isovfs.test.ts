@@ -4,7 +4,6 @@ import { open, stat } from "node:fs/promises";
 import { IsoVolume } from "../installer/src/isovfs.ts";
 
 const ISO_CANDIDATES = [
-  "/home/hammad/repos/detective-barbie-web-port/DETECTV1_1.ISO",
   "DETECTV1_1.ISO",
 ];
 

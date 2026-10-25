@@ -7,11 +7,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD="${DETECTIVE_BUILD_WEB:-$ROOT/work/build-web-W}"
 EMSDK="${DETECTIVE_EMSDK:-$ROOT/work/tools/emsdk}"
-if [ ! -f "$EMSDK/emsdk_env.sh" ]; then
-  for alt in /home/hammad/repos/midtown-madness-1-team-action-web/work/tools/emsdk; do
-    if [ -f "$alt/emsdk_env.sh" ]; then EMSDK="$alt"; break; fi
-  done
-fi
+[ -f "$EMSDK/emsdk_env.sh" ] || { echo "Emscripten not found: set DETECTIVE_EMSDK or install it at $EMSDK"; exit 1; }
 source "$EMSDK/emsdk_env.sh" > /dev/null 2>&1
 export EMCC_CFLAGS="${EMCC_CFLAGS:--O3 -msimd128}"
 export EMCC_CPPFLAGS="${EMCC_CPPFLAGS:--O3 -msimd128}"

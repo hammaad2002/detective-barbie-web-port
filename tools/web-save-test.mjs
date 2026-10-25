@@ -48,7 +48,6 @@ function resolveIso(path) {
     path,
     join(ROOT, path),
     join(ROOT, "..", "..", "..", "detective-barbie-web-port", path),
-    join("/home/hammad/repos/detective-barbie-web-port", path),
   ];
   for (const c of candidates) if (existsSync(c)) return resolve(c);
   throw new Error(`disc image not found: ${path}`);
