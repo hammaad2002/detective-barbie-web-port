@@ -276,6 +276,9 @@ void ctl_poll(uint64_t fc) {
       out += "peek " + line.substr(5) + ":";
       for (unsigned i = 0; i < len; i++) snprintf(b, sizeof b, " %02x", ld8(addr + i)), out += b;
       out += "\n";
+    } else if (line == "stats") {
+      for (int i = 0; i < rt::StatCount; i++) out += std::to_string(rt::g_stats[i].load()) + " ";
+      out += "\n";
     } else if (double sc = 0; sscanf(line.c_str(), "speed %lf", &sc) == 1) {
       rt::set_time_scale(sc);
       out += "speed set\n";

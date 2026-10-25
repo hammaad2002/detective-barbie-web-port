@@ -140,6 +140,12 @@ EMSCRIPTEN_KEEPALIVE int web_render_init(const char* canvas_selector) {
 EMSCRIPTEN_KEEPALIVE int web_render_tick() {
   const uint64_t fc = ddraw::frame_counter();
   EM_ASM({ Module.__ddrawFrameCounter = $0; }, (double)fc);
+  // Game frame statistics for tools/web-fps.mjs: [flips, primaryBlts, cursorPolls, sleeps, locks].
+  EM_ASM({ (Module.__gameStats = Module.__gameStats || [])[$0] = $1; }, 0, (double)rt::g_stats[rt::StatFlips]);
+  EM_ASM({ Module.__gameStats[$0] = $1; }, 1, (double)rt::g_stats[rt::StatPrimaryBlts]);
+  EM_ASM({ Module.__gameStats[$0] = $1; }, 2, (double)rt::g_stats[rt::StatCursorPolls]);
+  EM_ASM({ Module.__gameStats[$0] = $1; }, 3, (double)rt::g_stats[rt::StatSleeps]);
+  EM_ASM({ Module.__gameStats[$0] = $1; }, 4, (double)rt::g_stats[rt::StatLocks]);
   // Compose every tick: the game also draws through Lock/Unlock and GDI without bumping the counter.
   if (fc > 0) {
     int w = 0, h = 0;

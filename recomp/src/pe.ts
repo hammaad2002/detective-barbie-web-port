@@ -22,6 +22,8 @@ export interface Import {
   iatSlot: number;
 }
 
+import { applyCodePatches } from "./patches.ts";
+
 export class PeImage {
   readonly bytes: Uint8Array;
   readonly imageBase: number;
@@ -79,6 +81,7 @@ export class PeImage {
       const n = Math.min(s.rawSize, s.vsize || s.rawSize, bytes.length - s.rawOffset);
       if (n > 0) this.mapped.set(bytes.subarray(s.rawOffset, s.rawOffset + n), s.va - this.imageBase);
     }
+    applyCodePatches(this.mapped, this.imageBase);
 
     const imp = dir(1);
     if (imp.rva) {

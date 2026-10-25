@@ -452,6 +452,8 @@ static int64_t now_ms() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+std::atomic<uint64_t> g_stats[StatCount];
+
 void note_present() { g_last_present_ms = now_ms(); }
 
 // Guest clock (timeGetTime, GetTickCount, QueryPerformanceCounter, Sleep). Normally real time; a debug

@@ -17,6 +17,10 @@
 
 using namespace rt;
 
+namespace ddraw {
+void publish_frame();  // snapshot the finished frame for the presenter (defined with compose)
+}
+
 namespace {
 
 using HWND = uint32_t;
@@ -94,6 +98,7 @@ struct DisplayMode {
 
 std::recursive_mutex g_dd_mutex;
 std::atomic<uint64_t> g_frame_counter{0};
+thread_local bool t_drew_primary = false;  // this thread drew to the visible surface (the game's frame thread)
 DisplayMode g_mode, g_saved_mode;
 bool g_mode_set = false;
 HWND g_hwnd = 0;
@@ -313,7 +318,7 @@ class DrawSurface : public ComObject {
   bool is_primary_visible() const { return g_visible_primary == this; }
 
   void bump_if_primary() {
-    if (caps & DDSCAPS_PRIMARYSURFACE) g_frame_counter++;
+    if (caps & DDSCAPS_PRIMARYSURFACE) g_frame_counter++, g_stats[StatPrimaryBlts]++, t_drew_primary = true;
   }
 };
 
@@ -414,6 +419,10 @@ void gdi_draw_glyph_surface(DrawSurface* s, int x, int y, int ch, int font_h, ui
   if (ch < 32 || ch > 127) ch = '?';
   const uint8_t* glyph = kFont8x16[ch - 32];
   const int scale = std::max(1, (font_h + 8) / 16);
+  // Palette lookups once per glyph, not per pixel (the game redraws its menu text every frame).
+  const bool indexed = s->pf.bpp == 8 && pal;
+  const uint32_t fg_index = indexed ? nearest_palette_index(pal, fr, fg, fb) : 0;
+  const uint32_t bg_index = indexed && bk_mode == 2 ? nearest_palette_index(pal, br, bg, bb) : 0;
   for (int row = 0; row < 16; row++) {
     uint8_t bits = glyph[row];
     for (int col = 0; col < 8; col++) {
@@ -422,11 +431,11 @@ void gdi_draw_glyph_surface(DrawSurface* s, int x, int y, int ch, int font_h, ui
         for (int sx = 0; sx < scale; sx++) {
           int px = x + col * scale + sx;
           int py = y + row * scale + sy;
-          if (s->pf.bpp == 8 && pal) {
+          if (indexed) {
             if (on)
-              write_pixel(s, px, py, nearest_palette_index(pal, fr, fg, fb), pal);
+              write_pixel(s, px, py, fg_index, pal);
             else if (bk_mode == 2)
-              write_pixel(s, px, py, nearest_palette_index(pal, br, bg, bb), pal);
+              write_pixel(s, px, py, bg_index, pal);
           } else {
             uint32_t c = on ? colorref_to_bgra(fg_cref) : colorref_to_bgra(bg_cref);
             if (on || bk_mode == 2) write_pixel(s, px, py, c, pal);
@@ -447,8 +456,14 @@ void blt_rect(DrawSurface* dst, const RECT* dr, DrawSurface* src, const RECT* sr
   if (!dst || !dst->mem) return;
   RECT d = dr ? *dr : RECT{0, 0, (int32_t)dst->w, (int32_t)dst->h};
   if (flags & DDBLT_COLORFILL) {
-    for (int y = d.top; y < d.bottom; y++)
-      for (int x = d.left; x < d.right; x++) write_pixel(dst, x, y, fill_color, nullptr);
+    if (dst->pf.bpp == 8) {  // fast path: row memset over the clipped rectangle
+      const int x0 = std::max<int>(d.left, 0), x1 = std::min<int>(d.right, (int)dst->w);
+      for (int y = std::max<int>(d.top, 0); y < std::min<int>(d.bottom, (int)dst->h) && x1 > x0; y++)
+        memset(host(dst->mem + y * dst->pitch + x0), (uint8_t)fill_color, x1 - x0);
+    } else {
+      for (int y = d.top; y < d.bottom; y++)
+        for (int x = d.left; x < d.right; x++) write_pixel(dst, x, y, fill_color, nullptr);
+    }
     dst->bump_if_primary();
     return;
   }
@@ -457,6 +472,37 @@ void blt_rect(DrawSurface* dst, const RECT* dr, DrawSurface* src, const RECT* sr
   int dw = d.right - d.left, dh = d.bottom - d.top;
   int sw = s.right - s.left, sh = s.bottom - s.top;
   if (dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0) return;
+  // Fast path for the common case (every blit this game makes): same format, no stretching.
+  // Clip once, then copy rows; colour-keyed 8-bit sprites skip key bytes.
+  if (dw == sw && dh == sh && src->pf.bpp == dst->pf.bpp) {
+    int dx = d.left, dy = d.top, sx = s.left, sy = s.top, w = dw, h = dh;
+    if (dx < 0) sx -= dx, w += dx, dx = 0;
+    if (dy < 0) sy -= dy, h += dy, dy = 0;
+    if (sx < 0) dx -= sx, w += sx, sx = 0;
+    if (sy < 0) dy -= sy, h += sy, sy = 0;
+    w = std::min({w, (int)dst->w - dx, (int)src->w - sx});
+    h = std::min({h, (int)dst->h - dy, (int)src->h - sy});
+    const int bpp = (int)dst->pf.bpp / 8;
+    const bool key = (flags & DDBLT_KEYSRC) && src->has_ck_src;
+    if (w > 0 && h > 0 && (!key || bpp == 1)) {
+      const bool bottom_up = src == dst && dy > sy;  // overlapping self-blit moving down
+      for (int r = 0; r < h; r++) {
+        const int row = bottom_up ? h - 1 - r : r;
+        uint8_t* dp = host(dst->mem + (dy + row) * dst->pitch + dx * bpp);
+        const uint8_t* sp = host(src->mem + (sy + row) * src->pitch + sx * bpp);
+        if (!key) {
+          memmove(dp, sp, (size_t)w * bpp);
+        } else {
+          const uint8_t k = (uint8_t)src->ck_src;
+          for (int i = 0; i < w; i++)
+            if (sp[i] != k) dp[i] = sp[i];
+        }
+      }
+      dst->bump_if_primary();
+      if (w == (int)dst->w && h == (int)dst->h && (dst->caps & DDSCAPS_PRIMARYSURFACE)) ddraw::publish_frame();
+      return;
+    }
+  }
   const uint8_t* pal = src->palette ? src->palette->entries : (dst->palette ? dst->palette->entries : nullptr);
   for (int y = 0; y < dh; y++) {
     int sy = s.top + y * sh / dh;
@@ -614,6 +660,7 @@ uint32_t sfc_Flip(Cpu* c, ComObject* self) {
     else if (g_visible_primary == a) g_visible_primary = s;
   }
   g_frame_counter++;
+  g_stats[StatFlips]++;
   // Debug slow motion (set_time_scale < 1): stretch frame-driven logic the same way as the clock.
   if (const double ts = time_scale(); ts < 1.0) std::this_thread::sleep_for(std::chrono::milliseconds((int)(16.0 / ts - 16.0)));
   return DD_OK;
@@ -621,6 +668,7 @@ uint32_t sfc_Flip(Cpu* c, ComObject* self) {
 
 uint32_t sfc_Lock(Cpu* c, ComObject* self) {
   auto* s = surf(self);
+  g_stats[StatLocks]++;  // the game locks its frame buffer once per rendered frame
   uint32_t desc = arg(c, 2);
   s->lock_count++;
   fill_surface_desc(desc, s, true);
@@ -1083,6 +1131,56 @@ void compose_surface_rgba8(DrawSurface* src, uint8_t* dst, int w, int h) {
 
 }  // namespace
 
+namespace {
+std::mutex g_snap_mutex;      // guards the published snapshot only (held for one memcpy)
+std::vector<uint8_t> g_snap, g_snap_work;
+int g_snap_w = 0, g_snap_h = 0;
+std::chrono::steady_clock::time_point g_snap_time;
+std::atomic<bool> g_snap_valid{false};
+}  // namespace
+
+void frame_boundary() {
+  if (!t_drew_primary) return;
+  g_stats[StatDdThreadSleeps]++;
+  publish_frame();
+}
+
+void publish_frame() {
+  const auto now = std::chrono::steady_clock::now();
+  if (g_snap_valid && now - g_snap_time < std::chrono::milliseconds(8)) return;  // >120 fps is wasted work
+  int w = 0, h = 0;
+  {
+    std::lock_guard<std::recursive_mutex> lock(g_dd_mutex);
+    DrawSurface* src = g_visible_primary;
+    if (!src || !src->mem) return;  // GDI-only screens use the regular compose path
+    w = (int)src->w;
+    h = (int)src->h;
+    g_snap_work.resize((size_t)w * h * 4);
+    compose_surface_rgba8(src, g_snap_work.data(), w, h);
+    overlay_gdi_on_rgba((uint32_t*)g_snap_work.data(), w, h);
+  }
+  std::lock_guard<std::mutex> lock(g_snap_mutex);
+  g_snap.swap(g_snap_work);
+  g_snap_w = w;
+  g_snap_h = h;
+  g_snap_time = now;
+  g_snap_valid = true;
+  g_stats[StatSnapshots]++;
+}
+
+// Latest whole frame from frame_boundary, if one was published recently (otherwise the caller
+// composes the live surface: movie and GDI screens have no frame-cap Sleep on the game thread).
+static bool take_snapshot(uint8_t* dst, int dst_bytes, int& w, int& h) {
+  if (!g_snap_valid) return false;
+  std::lock_guard<std::mutex> lock(g_snap_mutex);
+  if (std::chrono::steady_clock::now() - g_snap_time > std::chrono::milliseconds(100)) return false;
+  if ((size_t)dst_bytes < g_snap.size()) return false;
+  w = g_snap_w;
+  h = g_snap_h;
+  memcpy(dst, g_snap.data(), g_snap.size());
+  return true;
+}
+
 bool compose(std::vector<uint32_t>& rgba, int& w, int& h) {
   std::unique_lock<std::recursive_mutex> lock(g_dd_mutex, std::try_to_lock);
   if (!lock.owns_lock()) return false;
@@ -1106,6 +1204,7 @@ bool compose(std::vector<uint32_t>& rgba, int& w, int& h) {
 
 bool compose_rgba8(uint8_t* dst, int dst_bytes, int& w, int& h, uint8_t** out_buf) {
   const auto t0 = std::chrono::steady_clock::now();
+  if (dst && take_snapshot(dst, dst_bytes, w, h)) return true;
   std::unique_lock<std::recursive_mutex> lock(g_dd_mutex, std::try_to_lock);
   if (!lock.owns_lock()) return false;
   DrawSurface* src = g_visible_primary;
@@ -1145,6 +1244,7 @@ bool compose_rgba8(uint8_t* dst, int dst_bytes, int& w, int& h, uint8_t** out_bu
 
 void gdi_blit_dib(int dx, int dy, int dw, int dh, int sx, int sy, int sw, int sh, uint32_t bits, uint32_t bmi,
                   bool bottom_up) {
+  g_stats[StatGdiBlits]++;
   std::lock_guard<std::recursive_mutex> lock(g_dd_mutex);
   if (!bmi) return;
   int bpp = (int)ld16(bmi + 14);

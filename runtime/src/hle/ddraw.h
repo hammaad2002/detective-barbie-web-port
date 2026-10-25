@@ -18,6 +18,11 @@ bool compose(std::vector<uint32_t>& rgba, int& w, int& h);
 // scratch buffer when dst is null (returns pointer via out_buf). Returns false until ready.
 bool compose_rgba8(uint8_t* dst, int dst_bytes, int& w, int& h, uint8_t** out_buf = nullptr);
 
+// The game draws straight onto the visible primary surface (no Flip) and its frame loops end in a
+// frame-cap Sleep. Called from Sleep: on the thread that draws the frames, snapshot the finished
+// frame so the presenter shows whole frames without contending for the DirectDraw lock.
+void frame_boundary();
+
 // Cumulative / last compose time in microseconds (web perf).
 uint64_t compose_time_us();
 uint64_t last_compose_us();

@@ -76,7 +76,9 @@ const ENTRY = [
 const PLAY = [[1400, 320, 240], [1500, 320, 240], [1600, 320, 240], [1700, 320, 240], [1800, 320, 240], [1900, 400, 400], [2100, 320, 240], [2200, 320, 240], [2300, 300, 380], [2400, 420, 360], [2500, 360, 320], [2600, 500, 350], [2700, 180, 280], [2800, 580, 400], [3000, 320, 240]].map(([frame, x, y]) => ({ frame, x, y, click: true }));
 
 SCENES.push(
-  { name: "cutscene", setup: async (page) => { await runEvents(page, ENTRY); await waitFrames(page, 1350); } },
+  // Profile (name entry) screen: a menu screen with the game's own cursor.
+  { name: "profile", setup: async (page) => { await runEvents(page, ENTRY.slice(0, 1)); await waitFrames(page, 590); } },
+  { name: "cutscene", setup: async (page) => { await runEvents(page, ENTRY.slice(1)); await waitFrames(page, 1350); } },
   { name: "in-game", setup: async (page) => { await runEvents(page, PLAY); await waitFrames(page, 3200); } },
 );
 
@@ -148,11 +150,62 @@ async function bootGame(page, isoPath) {
   await page.waitForFunction(() => (window.__detect?.frames ?? 0) > 60, null, { timeout: Number(process.env.DETECT_BOOT_TIMEOUT_MS ?? 180_000) });
 }
 
+// Module.__gameStats = [flips, primaryBlts, cursorPolls, sleeps, locks] (runtime/src/web/web_main.cpp).
+const gameStats = (page) =>
+  page.evaluate(() => {
+    const g = globalThis.__detectiveModule?.__gameStats ?? [0, 0, 0, 0, 0];
+    return { polls: g[2], locks: g[4], t: performance.now() };
+  });
+
 async function measureScene(page, scene) {
   await page.evaluate(() => window.__perf?.reset());
   await scene.setup(page);
+  const a = await gameStats(page);
   await new Promise((r) => setTimeout(r, measureSec * 1000));
-  return page.evaluate(() => window.__perf?.snapshot());
+  const b = await gameStats(page);
+  const snap = await page.evaluate(() => window.__perf?.snapshot());
+  // What the player sees while moving the mouse: circle the cursor every animation frame for 4 s
+  // and count canvas updates whose content changed (the game draws its own cursor into its frames).
+  const visibleFps = await page.evaluate(
+    () =>
+      new Promise((resolve) => {
+        const mod = globalThis.__detectiveModule;
+        const c = document.getElementById("canvas");
+        const ctx = c.getContext("2d");
+        let last = "", changes = 0, t0 = 0, px = 320, py = 240;
+        const step = (t) => {
+          if (!t0) t0 = t;
+          const a = (t - t0) / 400;
+          const x = Math.round(320 + 120 * Math.cos(a)), y = Math.round(260 + 80 * Math.sin(a));
+          mod?._web_mouse_move(x, y, x - px, y - py);
+          px = x;
+          py = y;
+          const d = ctx.getImageData(0, 0, c.width, c.height).data;
+          let h = 0;
+          for (let i = 0; i < d.length; i += 4 * 7) h = (h * 31 + d[i] + d[i + 1] * 3) | 0;
+          const key = String(h);
+          if (key !== last) changes++, (last = key);
+          if (t - t0 < 4000) requestAnimationFrame(step);
+          else resolve(changes / ((t - t0) / 1000));
+        };
+        requestAnimationFrame(step);
+      }),
+  );
+  if (snap) snap.visibleFps = visibleFps;
+  if (process.env.DETECT_SHOTS && scene.name === "profile") {
+    for (const [i, [x, y]] of [[150, 150], [450, 330], [300, 250]].entries()) {
+      await page.evaluate(([x, y]) => globalThis.__detectiveModule?._web_mouse_move(x, y, 0, 0), [x, y]);
+      for (const ms of [50, 250, 1000]) {
+        await page.waitForTimeout(ms === 50 ? 50 : ms - (ms === 250 ? 50 : 250));
+        await page.locator("#canvas").screenshot({ path: `work/shot-${i}-${ms}.png` });
+      }
+    }
+  }
+  const dt = (b.t - a.t) / 1000;
+  // The game's own frame rate: it locks its frame buffer once per rendered frame.
+  if (snap) snap.gameFps = (b.locks - a.locks) / dt;
+  if (snap) snap.cursorPolls = (b.polls - a.polls) / dt;
+  return snap;
 }
 
 function fmtRow(cols) {
@@ -203,7 +256,7 @@ try {
   if (!(await page.evaluate(() => crossOriginIsolated))) throw new Error("missing COOP/COEP");
 
   console.log(`web-fps: ${measureSec}s per scene, browser=${browserName} (headless ≈ software GL)`);
-  console.log(fmtRow(["scene", "presentFps", "rafFps", "p95Ms", "composeMs", "uploadMs", "guestFlipFps"]));
+  console.log(fmtRow(["scene", "presentFps", "rafFps", "p95Ms", "composeMs", "uploadMs", "visibleFps", "cursorPolls/s", "locks/s"]));
 
   for (const scene of SCENES) {
     const snap = await measureScene(page, scene);
@@ -218,7 +271,9 @@ try {
         snap.rafP95Ms.toFixed(2),
         snap.composeMs.toFixed(2),
         snap.uploadMs.toFixed(2),
-        snap.guestFlipFps.toFixed(1),
+        snap.visibleFps.toFixed(1),
+        snap.cursorPolls.toFixed(1),
+        snap.gameFps.toFixed(0),
       ]) + (pass ? "" : " FAIL"),
     );
     if (!pass) throw new Error(`${scene.name}: presentFps=${snap.presentFps.toFixed(1)} p95=${snap.rafP95Ms.toFixed(2)}ms`);

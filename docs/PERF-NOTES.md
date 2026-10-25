@@ -56,3 +56,27 @@ The machine has 20 CPU threads; a slow single-core device was not measured. The 
 | Chrome, CPU throttled x6 (`DETECT_BOOT_TIMEOUT_MS=500000 DETECT_CPU_THROTTLE=6`) | 60.0 on all 5 | 17.40-17.49 |
 At x6 the first in-browser translation took much longer (the default 180 s boot wait was exceeded); later starts use the OPFS cache. CPU throttling is an approximation of a slow device, not a real one.
 Cutscene audio (native mixer dump `DETECTIVE_AUDIO_DUMP`, entry script, 93 s): silence during load, speech-like sections from ~12 s, then loud music/ambience; clipping above 0.95 full scale in 0.05% of samples. Not listened to by ear.
+
+## Real game frame rate and cursor (2026-10-26)
+The earlier "60 fps" figures measured how often the page presented a frame, not how often the game
+produced a new one. `tools/web-fps.mjs` now moves the mouse every animation frame and counts frames
+whose content changed (`visibleFps`): what a player sees.
+
+| Scene | visibleFps before | after (Chrome / Firefox / WebKit) |
+|---|---|---|
+| title | 3 | 59.8 / 59.5 / 60.5 |
+| carnival hub, profile (menus) | 1-3 | 60.3 / 60.2 / 62.5 |
+| in-game (Area 1) | 15 | 60.0 / 60.2 / 62.5 |
+| cutscene | 19 | 19.7 / 20.2 / 19.7 (the video's own frame rate) |
+
+Causes and fixes:
+1. GDI text searched the 256-colour palette for every glyph pixel; menus redraw their text every frame,
+   so this took 84% of the CPU on the profile screen. Lookup now happens once per glyph.
+2. The page's compose only try-locks the DirectDraw lock, which the game holds almost continuously on
+   menus, so it got a frame 2-3 times a second. The game thread now publishes a snapshot of each finished
+   frame (on the full-screen blit that presents it, or the frame-cap Sleep) and the page shows that.
+3. The game caps its loops at 62/66 ms (15-16 fps) and its menu cursor object re-arms every 30 ms.
+   `recomp/src/patches.ts` lowers these (5-10 ms) at translation time. All game logic in these loops is
+   scheduled by timeGetTime, so speed is unchanged: native intro timing 186.1 s -> 185.6 s, walking
+   distance per 3 s 604 -> 604 px.
+4. Blits: same-format unscaled blits use row copies instead of per-pixel calls.

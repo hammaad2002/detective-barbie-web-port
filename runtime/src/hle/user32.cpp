@@ -565,8 +565,7 @@ HLE_STDCALL(kDll, GetCursorPos, 1) {
   uint32_t p = arg(c, 0);
   st32(p + 0, (uint32_t)x);
   st32(p + 4, (uint32_t)y);
-  static int gcp_count = 0;
-  if (++gcp_count % 60 == 0) log(Log::Info, "user32: GetCursorPos (%d, %d)", x, y);
+  rt::g_stats[rt::StatCursorPolls]++;
   return 1;
 }
 

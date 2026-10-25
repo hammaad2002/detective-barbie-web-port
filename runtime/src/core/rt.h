@@ -104,6 +104,9 @@ struct GuestThread {
 // Called by the renderer for every presented frame; BELLA_WATCHDOG=<seconds> reports what each
 // guest thread is doing when no frame has been presented for that long.
 void note_present();
+// Lightweight counters for performance diagnostics (DETECTIVE_STATS natively, Module.__perfNative on the web).
+enum Stat { StatFlips, StatPrimaryBlts, StatCursorPolls, StatSleeps, StatLocks, StatGdiBlits, StatDdThreadSleeps, StatSnapshots, StatCount };
+extern std::atomic<uint64_t> g_stats[StatCount];
 // Guest-visible monotonic clock in microseconds since start; scaled by set_time_scale (debug).
 uint64_t guest_clock_us();
 double time_scale();
