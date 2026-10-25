@@ -80,3 +80,12 @@ Causes and fixes:
    scheduled by timeGetTime, so speed is unchanged: native intro timing 186.1 s -> 185.6 s, walking
    distance per 3 s 604 -> 604 px.
 4. Blits: same-format unscaled blits use row copies instead of per-pixel calls.
+
+## Walking speed (2026-10-26)
+Raising the walk loop's rate made Barbie walk ~2.7x too far: in-game logic is one scripted object
+that advances one step per loop pass ("now + 1" reschedules), not per millisecond. The object
+scheduler called from the walk loop now reads a clock that advances in the original 62 ms steps
+(runtime/src/hle/user32.cpp, timeGetTime), so game logic runs exactly as often as in the original.
+The cursor object (script 0x43dd00) gets the live mouse position every pass, so the pointer still
+moves at 60 fps. Distance walked per press, original vs now: 0.3 s 88-109 vs 88 px, 0.6 s 199 vs
+199-201 px, 0.9 s 308 vs 312 px.
