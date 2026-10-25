@@ -272,13 +272,24 @@ uint32_t heap_alloc(uint32_t, uint32_t size, bool zero) {
   return g + 16;
 }
 
+// A pointer this heap could have returned: both allocators hand out 8-aligned addresses at least 16
+// bytes into the VirtualAlloc/heap arenas. Lets HeapFree/HeapSize/HeapReAlloc reject garbage
+// pointers the way Windows 95/98 did (BDETECT frees stale stack-resident strings in its scripts).
+static bool heap_pointer_plausible(uint32_t ptr) {
+  return (ptr & 7) == 0 && ptr >= kVirtualBase + 16 && ptr < kGuestTop;
+}
+
 uint32_t heap_size(uint32_t, uint32_t ptr) {
-  if (!ptr) return 0xffffffffu;
+  if (!heap_pointer_plausible(ptr)) return 0xffffffffu;
   return ld32(ptr - 16);
 }
 
 bool heap_free(uint32_t, uint32_t ptr) {
   if (!ptr) return true;
+  if (!heap_pointer_plausible(ptr)) {
+    log(Log::Warn, "HeapFree of invalid pointer 0x%08x ignored", ptr);
+    return false;
+  }
   uint32_t cookie = ld32(ptr - 12);
   if (cookie == kHeapVaCookie) {
     st32(ptr - 12, 0);
@@ -296,6 +307,7 @@ bool heap_free(uint32_t, uint32_t ptr) {
 
 uint32_t heap_realloc(uint32_t heap, uint32_t ptr, uint32_t size, bool zero) {
   if (!ptr) return heap_alloc(heap, size, zero);
+  if (!heap_pointer_plausible(ptr)) return 0;
   uint32_t old = heap_size(heap, ptr);
   if (ld32(ptr - 12) == kHeapVaCookie) {
     uint32_t neu = heap_alloc(heap, size, zero);
