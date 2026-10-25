@@ -319,35 +319,7 @@ std::string guest_basename_lower(const std::string& guest) {
   return slash == std::string::npos ? vfs_lower(rel) : vfs_lower(rel.substr(slash + 1));
 }
 
-bool guest_basename_is_gamehist(const std::string& guest) { return guest_basename_lower(guest) == "gamehist.ory"; }
-
 bool guest_basename_is_save_slot(const std::string& guest) { return sav_slot_name(guest_basename_lower(guest)); }
-
-// MSVC tagged streams; plain-text install fixtures (e.g. "Testing…") crash the serializer.
-bool gamehist_looks_like_valid_archive(const std::string& hostp) {
-  struct stat st;
-  if (stat(hostp.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return false;
-  if (st.st_size == 0) return true;
-  if (st.st_size >= 64) return true;
-  uint8_t hdr[8] = {};
-  FILE* fp = fopen(hostp.c_str(), "rb");
-  if (!fp) return false;
-  size_t n = fread(hdr, 1, sizeof hdr, fp);
-  fclose(fp);
-  if (n < 4) return false;
-  if (hdr[0] >= 0x20 && hdr[0] < 0x7f && hdr[1] >= 0x20 && hdr[1] < 0x7f) return false;
-  return true;
-}
-
-std::string empty_overlay_save(const std::string& guest) {
-  ensure_overlay_from_install();
-  std::string rel = guest_relative_key(vfs_guest_full_path(guest));
-  if (rel.empty()) return "";
-  std::string oh = overlay_host_for_rel(rel, true);
-  FILE* fp = fopen(oh.c_str(), "wb");
-  if (fp) fclose(fp);
-  return oh;
-}
 
 uint32_t open_file(const std::string& guest, uint32_t access, uint32_t disposition) {
   bool want_write = (access & GENERIC_WRITE) != 0;
@@ -371,38 +343,6 @@ uint32_t open_file(const std::string& guest, uint32_t access, uint32_t dispositi
   if (exists && S_ISDIR(st.st_mode)) {
     set_last_error(ERROR_ACCESS_DENIED);
     return kInvalidHandle;
-  }
-  if (!want_write && exists && !gamehist_looks_like_valid_archive(hostp)) {
-    if (guest_basename_is_gamehist(guest)) {
-      std::string empty = empty_overlay_save(guest);
-      if (!empty.empty()) {
-        if (trace_enabled("file"))
-          log(Log::Info, "CreateFile: invalid GameHist.ory at %s, using empty overlay %s", hostp.c_str(), empty.c_str());
-        hostp = empty;
-        exists = stat(hostp.c_str(), &st) == 0;
-      }
-    } else if (guest_basename_is_save_slot(guest)) {
-      std::string rel = guest_relative_key(vfs_guest_full_path(guest));
-      std::string oh = overlay_host_for_rel(rel, false);
-      if (host_exists_file(oh) && gamehist_looks_like_valid_archive(oh)) {
-        hostp = oh;
-        exists = true;
-      } else if (!gamehist_looks_like_valid_archive(hostp)) {
-        std::string empty = empty_overlay_save(guest);
-        if (!empty.empty()) {
-          if (trace_enabled("file"))
-            log(Log::Info, "CreateFile: invalid save stub %s, using empty overlay %s", hostp.c_str(), empty.c_str());
-          hostp = empty;
-          exists = stat(hostp.c_str(), &st) == 0;
-        } else {
-          set_last_error(ERROR_FILE_NOT_FOUND);
-          return kInvalidHandle;
-        }
-      } else {
-        set_last_error(ERROR_FILE_NOT_FOUND);
-        return kInvalidHandle;
-      }
-    }
   }
   const char* mode = nullptr;
   switch (disposition) {

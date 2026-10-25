@@ -104,6 +104,10 @@ struct GuestThread {
 // Called by the renderer for every presented frame; BELLA_WATCHDOG=<seconds> reports what each
 // guest thread is doing when no frame has been presented for that long.
 void note_present();
+// Guest-visible monotonic clock in microseconds since start; scaled by set_time_scale (debug).
+uint64_t guest_clock_us();
+double time_scale();
+void set_time_scale(double scale);
 void watchdog_start();
 
 GuestThread* current_thread();
@@ -141,6 +145,8 @@ struct ImportInfo {
 std::vector<ImportInfo> import_list();
 [[noreturn]] void process_exit(uint32_t code);
 void user32_pump();
+// Queue a message for the game window (PostMessageA); the main thread's message loop dispatches it.
+void user32_post(uint32_t msg, uint32_t wparam, uint32_t lparam);
 void user32_fullscreen_size(int w, int h);
 
 // Argument and return helpers for HLE functions (the return address is at [esp]).

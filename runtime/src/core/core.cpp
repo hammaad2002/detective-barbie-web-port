@@ -454,6 +454,37 @@ static int64_t now_ms() {
 
 void note_present() { g_last_present_ms = now_ms(); }
 
+// Guest clock (timeGetTime, GetTickCount, QueryPerformanceCounter, Sleep). Normally real time; a debug
+// time scale < 1 slows the whole game uniformly so interactive tools can play real-time minigames.
+static std::mutex g_clock_mutex;
+static double g_time_scale = 1.0;
+static int64_t g_clock_base_real = -1, g_clock_base_guest = 0;
+
+static int64_t real_us() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+uint64_t guest_clock_us() {
+  std::lock_guard<std::mutex> lock(g_clock_mutex);
+  const int64_t r = real_us();
+  if (g_clock_base_real < 0) g_clock_base_real = r;
+  return (uint64_t)(g_clock_base_guest + (int64_t)((double)(r - g_clock_base_real) * g_time_scale));
+}
+
+double time_scale() {
+  std::lock_guard<std::mutex> lock(g_clock_mutex);
+  return g_time_scale;
+}
+
+void set_time_scale(double scale) {
+  if (!(scale > 0.0)) return;
+  const uint64_t now = guest_clock_us();  // rebase so guest time stays continuous
+  std::lock_guard<std::mutex> lock(g_clock_mutex);
+  g_clock_base_real = real_us();
+  g_clock_base_guest = (int64_t)now;
+  g_time_scale = scale;
+}
+
 // ---- Sampling profiler (BELLA_PROFILE=start_s:duration_s) --------------------------------------
 // SIGPROF every millisecond of process CPU time records the interrupted host PC; the raw samples
 // are written to work/profile.txt and symbolised offline (tools/profile.py).

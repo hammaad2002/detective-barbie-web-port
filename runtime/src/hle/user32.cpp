@@ -65,7 +65,6 @@ std::deque<Msg> g_queue;
 int g_cursor_count = 0;
 bool g_window_visible = false;
 int g_win_x = 0, g_win_y = 0;
-const auto g_start = std::chrono::steady_clock::now();
 
 // Which user32 HLE entry is on the stack (for WM trace correlation).
 thread_local const char* g_hle_ctx = "";
@@ -100,9 +99,7 @@ uint32_t resource_id_from_name(uint32_t name_ptr) {
   return 0;
 }
 
-uint32_t now_ms() {
-  return (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_start).count();
-}
+uint32_t now_ms() { return (uint32_t)(rt::guest_clock_us() / 1000); }
 
 uint32_t send(Cpu* c, uint32_t msg, uint32_t wparam, uint32_t lparam) {
   if (!g_wndproc) return 0;
@@ -273,6 +270,7 @@ void pump() {
 
 namespace rt {
 void user32_pump() { pump(); }
+void user32_post(uint32_t msg, uint32_t wparam, uint32_t lparam) { post(msg, wparam, lparam); }
 // A fullscreen D3D device covers the screen at its display mode: the window's client area (and so
 // GetClientRect and mouse coordinates) becomes the back-buffer size.
 void user32_fullscreen_size(int w, int h) {

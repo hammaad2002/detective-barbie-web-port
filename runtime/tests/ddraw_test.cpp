@@ -214,16 +214,19 @@ int main() {
     st8(bmi + 40 + i * 4 + 2, (uint8_t)(255 - i));
     st8(bmi + 40 + i * 4 + 3, 0);
   }
-  const int pitch = ((dib_w + 3) / 4) * 4;
-  uint32_t bits = rt::heap_alloc(rt::process_heap(), pitch * dib_h, true);
-  memset(rt::host(bits), 0, pitch * dib_h);
+  const int dib_pitch = ((dib_w + 3) / 4) * 4;
+  uint32_t bits = rt::heap_alloc(rt::process_heap(), dib_pitch * dib_h, true);
+  memset(rt::host(bits), 0, dib_pitch * dib_h);
   for (int y = 0; y < dib_h; y++)
-    for (int x = 0; x < dib_w; x++) st8(bits + y * pitch + x, (uint8_t)(y * dib_w + x + 10));
+    for (int x = 0; x < dib_w; x++) st8(bits + y * dib_pitch + x, (uint8_t)(y * dib_w + x + 10));
 
   ddraw::gdi_blit_dib(0, 0, dib_w, dib_h, 0, 0, dib_w, dib_h, bits, bmi, true);
   expect(ddraw::compose(rgba, w, h), "compose after gdi blit");
   expect(w == 64 && h == 48, "compose still primary dimensions");
-  expect(px(0, 0) == 0xFFF51400u, "gdi blit palette index 10 -> R=245,G=20,B=0");
+  // Positive biHeight = bottom-up DIB: screen row 0 is the last row in memory. Palette entry i is R=255-i, G=2i.
+  auto pal_bgra = [](int i) { return 0xFF000000u | (uint32_t)(255 - i) << 16 | (uint32_t)(i * 2) << 8; };
+  expect(px(0, 0) == pal_bgra((dib_h - 1) * dib_w + 10), "gdi blit bottom-up: top-left shows last DIB row");
+  expect(px(0, dib_h - 1) == pal_bgra(10), "gdi blit bottom-up: bottom-left shows first DIB row");
 
   if (g_failures == 0) std::puts("ddraw_test PASS");
   else std::fprintf(stderr, "ddraw_test FAIL (%d)\n", g_failures);

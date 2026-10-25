@@ -248,6 +248,51 @@ void ensure_texture(int w, int h) {
   SDL_SetWindowSize(g_window, w, h);
 }
 
+// DETECTIVE_CTL=<dir>: live control for interactive debugging. Each presenter tick, if <dir>/cmd exists it is
+// consumed line by line: "dump <path>", "peek <hexaddr> <len>", "poke <hexaddr> <hexvalue>", or any DETECTIVE_INPUT
+// action (click(x,y)+hold, move(x,y), key(name)+hold) which is scheduled for the next frame. Results go to <dir>/ack.
+std::mutex g_ctl_mutex;
+std::vector<std::string> g_ctl_pending;
+
+void ctl_poll(uint64_t fc) {
+  static const char* dir = getenv("DETECTIVE_CTL");
+  if (!dir || !dir[0]) return;
+  const std::string cmd = std::string(dir) + "/cmd", tmp = cmd + ".run";
+  if (rename(cmd.c_str(), tmp.c_str()) != 0) return;
+  std::ifstream in(tmp);
+  std::string out = "frame " + std::to_string(fc) + "\n", line;
+  while (std::getline(in, line)) {
+    if (line.empty()) continue;
+    char path[512];
+    unsigned addr = 0, val = 0, len = 0;
+    if (sscanf(line.c_str(), "dump %511s", path) == 1) {
+      std::vector<uint32_t> rgba;
+      int w = 0, h = 0;
+      bool ok = false;
+      for (int tries = 0; tries < 200 && !(ok = ddraw::compose(rgba, w, h)); tries++) SDL_Delay(2);  // compose try-locks
+      out += (ok && write_ppm(path, rgba, w, h)) ? "dumped\n" : "dump failed\n";
+    } else if (sscanf(line.c_str(), "peek %x %u", &addr, &len) == 2) {
+      char b[4];
+      out += "peek " + line.substr(5) + ":";
+      for (unsigned i = 0; i < len; i++) snprintf(b, sizeof b, " %02x", ld8(addr + i)), out += b;
+      out += "\n";
+    } else if (double sc = 0; sscanf(line.c_str(), "speed %lf", &sc) == 1) {
+      rt::set_time_scale(sc);
+      out += "speed set\n";
+    } else if (sscanf(line.c_str(), "poke %x %x", &addr, &val) == 2) {
+      st32(addr, val);
+      out += "poked\n";
+    } else {
+      std::lock_guard<std::mutex> lock(g_ctl_mutex);
+      g_ctl_pending.push_back(line);
+      out += "queued " + line + "\n";
+    }
+  }
+  remove(tmp.c_str());
+  std::ofstream(std::string(dir) + "/ack.tmp") << out;
+  rename((std::string(dir) + "/ack.tmp").c_str(), (std::string(dir) + "/ack").c_str());
+}
+
 void presenter_loop() {
   uint64_t last = 0;
   std::vector<FrameDumpRequest> dumps = parse_frame_dumps();
@@ -272,6 +317,7 @@ void presenter_loop() {
         last = fc;
       }
     }
+    ctl_poll(fc);
     SDL_Delay(8);
   }
 }
@@ -633,6 +679,30 @@ size_t next_script_item(const std::string& s, size_t pos) {
   return std::string::npos;
 }
 
+void add_script_action(uint64_t frame, std::string action) {
+  ScriptedMouse m{};
+  m.frame = frame;
+  if (parse_mouse_action(action, &m)) {
+    g_mouse_script.push_back(m);
+    return;
+  }
+  ScriptedKey k{};
+  k.frame = frame;
+  k.hold = 4;
+  size_t plus = action.find('+');
+  if (plus != std::string::npos) {
+    k.hold = (uint32_t)atoi(action.c_str() + plus + 1);
+    action = action.substr(0, plus);
+  }
+  std::string key_name = action;
+  if (action.rfind("key(", 0) == 0 && action.size() > 5 && action.back() == ')') key_name = action.substr(4, action.size() - 5);
+  else if (action.rfind("key:", 0) == 0) key_name = action.substr(4);
+  k.sc = SDL_GetScancodeFromName(key_name.c_str());
+  if (k.sc == SDL_SCANCODE_UNKNOWN) rt::log(rt::Log::Warn, "scripted input: unknown key '%s'", key_name.c_str());
+  else g_script.push_back(k);
+
+}
+
 void parse_script() {
   g_script_parsed = true;
   const char* e = getenv("DETECTIVE_INPUT");
@@ -656,26 +726,7 @@ void parse_script() {
       frame = strtoull(item.c_str(), nullptr, 10);
       action = item.substr(colon + 1);
     }
-    ScriptedMouse m{};
-    m.frame = frame;
-    if (parse_mouse_action(action, &m)) {
-      g_mouse_script.push_back(m);
-      continue;
-    }
-    ScriptedKey k{};
-    k.frame = frame;
-    k.hold = 4;
-    size_t plus = action.find('+');
-    if (plus != std::string::npos) {
-      k.hold = (uint32_t)atoi(action.c_str() + plus + 1);
-      action = action.substr(0, plus);
-    }
-    std::string key_name = action;
-    if (action.rfind("key(", 0) == 0 && action.size() > 5 && action.back() == ')') key_name = action.substr(4, action.size() - 5);
-    else if (action.rfind("key:", 0) == 0) key_name = action.substr(4);
-    k.sc = SDL_GetScancodeFromName(key_name.c_str());
-    if (k.sc == SDL_SCANCODE_UNKNOWN) rt::log(rt::Log::Warn, "scripted input: unknown key '%s'", key_name.c_str());
-    else g_script.push_back(k);
+    add_script_action(frame, action);
   }
 }
 
@@ -839,6 +890,11 @@ void scripted_key_start_one(uint64_t f, uint64_t max_frame, std::vector<InputEve
 void scripted_events(std::vector<InputEvent>& out) {
   if (!g_script_parsed) parse_script();
   uint64_t f = g_frame.load();
+  {
+    std::lock_guard<std::mutex> lock(g_ctl_mutex);
+    for (auto& a : g_ctl_pending) add_script_action(f + 1, a);
+    g_ctl_pending.clear();
+  }
   scripted_mouse_releases(out, f);
   scripted_key_releases(f, out);
 

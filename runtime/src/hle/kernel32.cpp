@@ -67,10 +67,7 @@ uint8_t u16_to_cp1252(uint16_t w, bool* lossy) {
   return '?';
 }
 
-const auto g_start = std::chrono::steady_clock::now();
-uint64_t micros() {
-  return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - g_start).count();
-}
+uint64_t micros() { return guest_clock_us(); }
 
 // Critical sections are keyed by their guest address.
 std::mutex g_cs_mutex;
@@ -661,7 +658,7 @@ HLE_STDCALL(kDll, Sleep, 1) {
     return 0;
   }
 #endif
-  if (ms) std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+  if (ms) std::this_thread::sleep_for(std::chrono::microseconds((int64_t)(ms * 1000.0 / time_scale())));
   else std::this_thread::yield();
   return 0;
 }

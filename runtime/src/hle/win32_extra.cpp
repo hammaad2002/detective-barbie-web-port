@@ -318,11 +318,9 @@ static uint32_t impl_VkKeyScanA(Cpu* c) {
 
 HLE_STDCALL(kUser32, VkKeyScanA, 1) { return impl_VkKeyScanA(c); }
 
+// The game posts WM_KEYDOWN/VK_ESCAPE to its own window to quit from the end screen.
 HLE_STDCALL(kUser32, PostMessageA, 4) {
-  (void)arg(c, 0);
-  (void)arg(c, 1);
-  (void)arg(c, 2);
-  (void)arg(c, 3);
+  user32_post(arg(c, 1), arg(c, 2), arg(c, 3));
   return 1;
 }
 

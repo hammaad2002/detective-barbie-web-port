@@ -28,7 +28,7 @@ run_step "vitest" npm test
 
 if [ ! -f "$NATIVE_BUILD/import_coverage" ]; then
   cmake -S "$ROOT/runtime" -B "$NATIVE_BIN" -DDETECTIVE_NO_GAME_CODE=ON > /dev/null
-  cmake --build "$NATIVE_BIN" -j"$(nproc)" import_coverage > /dev/null
+  cmake --build "$NATIVE_BIN" -j"$(nproc)" --target import_coverage > /dev/null
 fi
 run_step "import_coverage" "$NATIVE_BUILD/import_coverage" "$ROOT/work/ref/BDETECT.EXE"
 run_step "win32_extra_check" bash "$ROOT/runtime/tests/win32_extra_check.sh"

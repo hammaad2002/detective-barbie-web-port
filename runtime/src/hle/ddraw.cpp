@@ -6,6 +6,7 @@
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
+#include <thread>
 #include <vector>
 
 #include "../core/objects.h"
@@ -613,6 +614,8 @@ uint32_t sfc_Flip(Cpu* c, ComObject* self) {
     else if (g_visible_primary == a) g_visible_primary = s;
   }
   g_frame_counter++;
+  // Debug slow motion (set_time_scale < 1): stretch frame-driven logic the same way as the clock.
+  if (const double ts = time_scale(); ts < 1.0) std::this_thread::sleep_for(std::chrono::milliseconds((int)(16.0 / ts - 16.0)));
   return DD_OK;
 }
 
