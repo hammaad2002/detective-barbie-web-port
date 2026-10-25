@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Licenses — Detective Barbie in your browser</title>
+    <style>
+      :root { --bg: #140f26; --panel: #1f1838; --ink: #f5f2fc; --muted: #a69bbd; --accent: #e5b342; }
+      * { box-sizing: border-box; }
+      body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.6 system-ui, sans-serif; }
+      main { max-width: 760px; margin: 0 auto; padding: 32px 16px; }
+      h1 { font-size: 24px; margin: 0 0 8px; }
+      h2 { font-size: 17px; margin: 28px 0 6px; color: var(--accent); }
+      p, li { color: var(--muted); }
+      strong, a { color: var(--ink); }
+      code { background: var(--panel); padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Licenses and notices</h1>
+      <p><a href="./">← Back to the game</a></p>
+
+      <h2>This site</h2>
+      <p>The page, the installer, the in-browser translator and the engine are open source:
+        <a href="__REPO_URL__">__REPO_URL__</a> (see its LICENSE file). The site contains no part of
+        <em>Detective Barbie</em>: players unpack their own disc image in their browser, and the
+        game's program is translated there.</p>
+      <p>Not affiliated with or endorsed by Mattel. <em>Detective Barbie</em> and related names are
+        trademarks of Mattel.</p>
+
+      <h2>Site code — MIT</h2>
+      <p>The TypeScript and C++ sources in the repository (installer, recompiler, runtime, and web
+        shell) are licensed under the MIT license in the repository's <code>LICENSE</code> file.</p>
+
+      <h2>iced-x86 — MIT</h2>
+      <p>The in-browser translator decodes x86 instructions with <a href="https://github.com/icedland/iced">iced</a>
+        (iced-x86 1.21.0), Copyright (C) 2018-present iced project and contributors, under the MIT license.</p>
+
+      <h2>Emscripten — MIT</h2>
+      <p>The engine is compiled with <a href="https://emscripten.org">Emscripten</a> 6.0.12, whose runtime code
+        is under the MIT license (see the Emscripten project).</p>
+
+      <h2>dlmalloc — public domain</h2>
+      <p>The engine uses Doug Lea's malloc implementation (public domain).</p>
+
+      <h2>Vite — MIT</h2>
+      <p>The page is built with <a href="https://vite.dev">Vite</a>; its small module-loading helper is part of
+        the page's script.</p>
+    </main>
+  </body>
+</html>

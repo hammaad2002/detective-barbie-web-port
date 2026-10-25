@@ -1,0 +1,13 @@
+*.iso
+*.ISO
+work/
+research/
+node_modules/
+dist/
+web/public/engine/
+.venv/
+*.ppm
+.wrangler/
+web/runtime/
+__pycache__/
+saves/

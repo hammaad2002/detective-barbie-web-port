@@ -1,0 +1,2 @@
+# Generic Win32 registry App Paths string (HLE virtual registry; also appears in BDETECT.EXE import metadata).
+SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\bdetect.exe

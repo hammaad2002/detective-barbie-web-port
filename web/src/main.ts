@@ -1,0 +1,778 @@
+/**
+ * Page shell: installs the game from the player's disc image into OPFS, then starts the engine
+ * (WebAssembly runtime on worker threads) and drives rendering, input and audio from the page.
+ *
+ * Development switches (URL query; the dev server only — a production build ignores the query,
+ * so no shared link can, say, delete a visitor's saves): `devIso` installs from the dev server's
+ * local disc image, `autoplay` starts without waiting for a click, `keys=frame:Code[+hold],...`
+ * presses keys at presented frames, `capture=frame,...` keeps PNG snapshots in
+ * `window.__detect.captures`, `resetSave` deletes saves first, `env=K=V;...` sets engine
+ * environment variables, `input=` (or `window.__detectiveInput`) sets DETECTIVE_INPUT for the engine,
+ * `devEngine` uses the local C-backend engine build.
+ */
+/// <reference types="vite/client" />
+import { INSTALL_DIR, INSTALLING_MARKER, cacheName, sha256 } from "./cache.ts";
+import { canLockEscape, enterFullscreen, exitFullscreen, isFullscreen, watchFullscreen } from "./fullscreen.ts";
+import { Gamepads } from "./gamepads.ts";
+import { Input } from "./input.ts";
+import { KEYS } from "./keys.ts";
+import { loadPrefs } from "./prefs.ts";
+import { Help } from "./help.ts";
+import { applyImport, exportSaves, listSaves, planImport, SAVES_DIR, type ImportPlan } from "./saves.ts";
+import { SettingsPanel } from "./settings-ui.ts";
+import { applyGraphics, keyLabel } from "./settings.ts";
+
+const params = new URLSearchParams(import.meta.env.DEV ? location.search : "");
+// The player engine contains no game code: the game is translated in this browser. `devEngine`
+// selects the local C-backend build (served from work/ by the dev server).
+const DEV_ENGINE = import.meta.env.DEV && params.has("devEngine");
+const ENGINE_URL = DEV_ENGINE ? "/dev-engine/detectivebarbie.js" : "/engine/detective_player.js";
+
+const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
+const prefs = loadPrefs();
+try {
+  localStorage.setItem("detect.prefs", JSON.stringify(prefs));
+} catch {
+  // Ignore when storage is blocked.
+}
+const pads = new Gamepads();
+const help = new Help(prefs);
+const status = $("status");
+const progress = $<HTMLProgressElement>("progress");
+const logEl = $("log");
+
+function log(msg: string, error = false) {
+  const line = document.createElement("div");
+  line.textContent = msg;
+  if (error) line.className = "error";
+  logEl.append(line);
+  logEl.scrollTop = logEl.scrollHeight;
+  (error ? console.error : console.log)(msg);
+}
+
+interface DevState {
+  frames: number;
+  captures: Record<number, string>;
+  log: string[];
+  state: string;
+  /** Dev-only: ms from Play click until the engine reaches "running" (set when `?timing` is in the URL). */
+  playStartMs?: number;
+}
+const dev: DevState = { frames: 0, captures: {}, log: [], state: "init" };
+(window as unknown as { __detect: DevState }).__detect = dev;
+
+/** Headless audio gate (`?audioTap`): peak level sampled from an AnalyserNode on the game output. */
+interface AudioTap {
+  contextState: () => AudioContextState;
+  resume: () => Promise<void>;
+  ringDelta: () => number;
+  maxPeak: number;
+  samplePeak: () => number;
+}
+
+export interface PerfSnapshot {
+  rafFps: number;
+  rafP95Ms: number;
+  presentFps: number;
+  guestFlipFps: number;
+  composeMs: number;
+  uploadMs: number;
+  ddrawFrame: number;
+  presentedFrames: number;
+  rafSamples: number;
+}
+
+interface WasmPerfModule {
+  __perfNative?: { composeUs: number; composeN: number; uploadUs: number; uploadN: number; guestFlips: number };
+  __ddrawFrameCounter?: number;
+}
+
+interface PerfState {
+  startMs: number;
+  lastRafMs: number;
+  rafDeltas: number[];
+  lastDdraw: number;
+  guestFlipDeltas: number[];
+  lastGuestFlips: number;
+  presented: number;
+  snapshot(engine?: WasmPerfModule): PerfSnapshot;
+  reset(): void;
+}
+
+const perf: PerfState = {
+  startMs: 0,
+  lastRafMs: 0,
+  rafDeltas: [],
+  lastDdraw: 0,
+  guestFlipDeltas: [],
+  lastGuestFlips: 0,
+  presented: 0,
+  reset() {
+    this.startMs = performance.now();
+    this.lastRafMs = 0;
+    this.rafDeltas = [];
+    this.lastDdraw = 0;
+    this.guestFlipDeltas = [];
+    this.lastGuestFlips = 0;
+    this.presented = 0;
+  },
+  snapshot(engine?: WasmPerfModule) {
+    const mod = engine ?? (globalThis as { __detectiveModule?: WasmPerfModule }).__detectiveModule;
+    const native = mod?.__perfNative;
+    const elapsed = (performance.now() - this.startMs) / 1000;
+    const rafSorted = [...this.rafDeltas].sort((a, b) => a - b);
+    const p95 = rafSorted.length ? rafSorted[Math.min(rafSorted.length - 1, Math.floor(rafSorted.length * 0.95))] : 0;
+    const rafFps = elapsed > 0 ? this.rafDeltas.length / elapsed : 0;
+    const flipFps =
+      this.guestFlipDeltas.length && elapsed > 0
+        ? this.guestFlipDeltas.reduce((a, b) => a + b, 0) / elapsed
+        : native && elapsed > 0
+          ? native.guestFlips / elapsed
+          : 0;
+    return {
+      rafFps,
+      rafP95Ms: p95,
+      presentFps: elapsed > 0 ? this.presented / elapsed : 0,
+      guestFlipFps: flipFps,
+      composeMs: native && native.composeN ? native.composeUs / native.composeN / 1000 : 0,
+      uploadMs: native && native.uploadN ? native.uploadUs / native.uploadN / 1000 : 0,
+      ddrawFrame: mod?.__ddrawFrameCounter ?? 0,
+      presentedFrames: this.presented,
+      rafSamples: this.rafDeltas.length,
+    };
+  },
+};
+(window as unknown as { __perf: PerfState }).__perf = perf;
+
+function setState(s: string, text: string) {
+  dev.state = s;
+  status.textContent = text;
+}
+
+async function installed(): Promise<boolean> {
+  try {
+    const opfs = await navigator.storage.getDirectory();
+    const root = await opfs.getDirectoryHandle(INSTALL_DIR);
+    await root.getFileHandle("BDETECT.EXE");
+  } catch {
+    return false;
+  }
+  try {
+    // Left behind by an install that did not finish.
+    await (await (await navigator.storage.getDirectory()).getDirectoryHandle(INSTALL_DIR)).getFileHandle(INSTALLING_MARKER);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+async function gameDir(): Promise<FileSystemDirectoryHandle> {
+  return (await navigator.storage.getDirectory()).getDirectoryHandle(INSTALL_DIR);
+}
+
+/** The cached translation of the installed exe, or null when it must be (re)translated. */
+async function cachedTranslation(): Promise<Uint8Array | null> {
+  const root = await gameDir();
+  const exe = await (await root.getFileHandle("BDETECT.EXE")).getFile();
+  const name = cacheName(await sha256(await exe.arrayBuffer()));
+  try {
+    const f = await (await (await root.getDirectoryHandle("cache")).getFileHandle(name)).getFile();
+    return new Uint8Array(await f.arrayBuffer());
+  } catch {
+    return null;
+  }
+}
+
+function runTranslate(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL("./translate-worker.ts", import.meta.url), { type: "module" });
+    progress.hidden = false;
+    setState("translating", "Translating the game for this browser…");
+    worker.onmessage = (e: MessageEvent) => {
+      const m = e.data;
+      if (m.type === "progress") {
+        progress.max = m.total || 1;
+        progress.value = m.done;
+        status.textContent =
+          m.phase === "discover" ? "Analysing the game program…" : m.phase === "translate" ? `Translating ${m.done} / ${m.total} functions…` : "Finishing…";
+      } else if (m.type === "done") {
+        worker.terminate();
+        progress.hidden = true;
+        log(`Translated ${m.functions} functions into ${(m.bytes / 1048576).toFixed(1)} MB of WebAssembly in ${m.seconds.toFixed(1)} s`);
+        resolve();
+      } else if (m.type === "error") {
+        worker.terminate();
+        reject(new Error(m.message));
+      }
+    };
+    worker.onerror = (e) => {
+      worker.terminate();
+      reject(new Error(`translator crashed: ${e.message}`));
+    };
+    worker.postMessage({});
+  });
+}
+
+/** Function entry addresses from the module's "bella.funcs" custom section. */
+function functionList(wasm: Uint8Array): Uint32Array {
+  let i = 8;
+  const leb = () => {
+    let v = 0, shift = 0, b: number;
+    do {
+      b = wasm[i++];
+      v |= (b & 0x7f) << shift;
+      shift += 7;
+    } while (b & 0x80);
+    return v >>> 0;
+  };
+  while (i < wasm.length) {
+    const id = wasm[i++];
+    const size = leb();
+    const end = i + size;
+    if (id === 0) {
+      const n = leb();
+      const name = new TextDecoder().decode(wasm.subarray(i, i + n));
+      i += n;
+      if (name === "bella.funcs" || name === "detect.funcs") {
+        const dv = new DataView(wasm.buffer, wasm.byteOffset + i, end - i);
+        const count = dv.getUint32(0, true);
+        return Uint32Array.from({ length: count }, (_, k) => dv.getUint32(4 + 4 * k, true));
+      }
+    }
+    i = end;
+  }
+  throw new Error("translated module has no function list");
+}
+
+/** The installed game takes about 560 MB; refuse early when the browser grants less. */
+async function checkSpace(): Promise<void> {
+  const NEED = 600 * 1048576;
+  try {
+    // A reinstall overwrites the existing files in place.
+    await (await navigator.storage.getDirectory()).getDirectoryHandle(INSTALL_DIR);
+    return;
+  } catch {
+    // Not installed yet.
+  }
+  const est = await navigator.storage.estimate().catch(() => ({}) as StorageEstimate);
+  if (est.quota !== undefined && est.quota - (est.usage ?? 0) < NEED) {
+    const mb = (n: number) => `${Math.floor(n / 1048576)} MB`;
+    throw new Error(`This browser lets this site store ${mb(est.quota - (est.usage ?? 0))}, and the game needs about ${mb(NEED)}. Free some disk space, or try another browser.`);
+  }
+}
+
+async function runInstall(file: Blob): Promise<void> {
+  await checkSpace();
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL("./install-worker.ts", import.meta.url), { type: "module" });
+    progress.hidden = false;
+    setState("installing", "Unpacking your disc image…");
+    worker.onmessage = (e: MessageEvent) => {
+      const m = e.data;
+      if (m.type === "progress") {
+        progress.max = m.total || 1;
+        progress.value = m.done;
+        status.textContent = `Unpacking ${m.done} / ${m.total} files…`;
+      } else if (m.type === "done") {
+        worker.terminate();
+        progress.hidden = true;
+        log(`Installed ${m.written} files (${(m.bytes / 1048576).toFixed(0)} MB, ${m.verified} verified) in ${m.seconds.toFixed(1)} s`);
+        for (const x of m.mismatches) log(`warning: ${x}`, true);
+        resolve();
+      } else if (m.type === "error") {
+        worker.terminate();
+        reject(new Error(m.message));
+      }
+    };
+    worker.postMessage({ file });
+  });
+}
+
+// ---- Engine ------------------------------------------------------------------------------------
+
+interface Engine {
+  HEAPU8: Uint8Array;
+  callMain(args: string[]): void;
+  _web_render_init(selector: number): number;
+  _web_render_tick(): number;
+  _web_audio_ring_create(rate: number): number;
+  _web_canvas_size(w: number, h: number): void;
+  _web_key(kind: number, vk: number, dik: number, ch: number): void;
+  _web_mouse_move(x: number, y: number, dx: number, dy: number): void;
+  _web_mouse_button(button: number, down: number, x: number, y: number): void;
+  _web_mouse_wheel(dy: number): void;
+  _web_focus(focused: number): void;
+  _web_client_size(): number;
+  _web_gamepad(slot: number, connected: number, buttons: number, lx: number, ly: number, rx: number, ry: number, lt: number, rt: number): void;
+  _web_gamepad_rumble(): number;
+  _web_set_detective_input?(script: number): void;
+  stringToNewUTF8(s: string): number;
+  _malloc(n: number): number;
+  _web_game_alloc(n: number): number;
+  _web_game_register(ptr: number, count: number): void;
+}
+
+async function resetSaves() {
+  const opfs = await navigator.storage.getDirectory();
+  try {
+    const saves = await opfs.getDirectoryHandle(SAVES_DIR);
+    for await (const name of (saves as unknown as { keys(): AsyncIterable<string> }).keys()) {
+      await saves.removeEntry(name, { recursive: true }).catch(() => {});
+    }
+  } catch {
+    // No saves tree yet.
+  }
+  const dir = await gameDir();
+  for await (const name of (dir as unknown as { keys(): AsyncIterable<string> }).keys()) {
+    if (/^(SAVGAME\d+\.AR\d+|CURRENT\.AR\d+)$/i.test(name)) await dir.removeEntry(name).catch(() => {});
+  }
+}
+
+async function play() {
+  setState("starting", "Starting…");
+  if (params.has("resetSave")) await resetSaves();
+  // Creates settings.dat on the first start; with "match screen" the resolution follows this screen.
+  await applyGraphics(prefs.autoResolution ? "auto" : undefined);
+  let game: Uint8Array | null = null;
+  if (!DEV_ENGINE) {
+    game = await cachedTranslation();
+    if (!game) {
+      await runTranslate();
+      game = await cachedTranslation();
+      if (!game) throw new Error("translation finished but its output is missing");
+    }
+  }
+  $("play-panel").hidden = true;
+  const canvas = $<HTMLCanvasElement>("canvas");
+  $("game").classList.add("on");
+
+  // Audio must be created during a user gesture (or it starts suspended).
+  const audio = new AudioContext({ sampleRate: 44100, latencyHint: "interactive" });
+  await audio.audioWorklet.addModule("/audio-worklet.js");
+
+  // Absolute URL: the engine is a static file, not a module for the dev server to transform.
+  const { default: createDetective } = await import(/* @vite-ignore */ new URL(ENGINE_URL, location.href).href);
+  // Development: engine environment variables (DETECT_WATCHDOG, DETECT_TRACE, ...) from `env=K=V;K=V`.
+  const env = Object.fromEntries(
+    (params.get("env") ?? "")
+      .split(";")
+      .filter(Boolean)
+      .map((kv) => [kv.slice(0, kv.indexOf("=")), kv.slice(kv.indexOf("=") + 1)]),
+  );
+  const detectiveInput =
+    params.get("input") ??
+    env.DETECTIVE_INPUT ??
+    (globalThis as { __detectiveInput?: string }).__detectiveInput ??
+    "";
+  const engine = (await createDetective({
+    canvas,
+    preRun: [(m: { ENV: Record<string, string> }) => Object.assign(m.ENV, env)],
+    print: (s: string) => dev.log.push(s),
+    printErr: (s: string) => {
+      dev.log.push(s);
+      if (s.includes("[fatal]") || s.includes("[error]")) console.error(s);
+    },
+  })) as Engine & WasmPerfModule;
+  (globalThis as { __detectiveModule?: WasmPerfModule }).__detectiveModule = engine;
+
+  // Fixed 640×480 game framebuffer; CSS scales to the fullscreen #game container with crisp pixels.
+  const GAME_W = 640;
+  const GAME_H = 480;
+  canvas.width = GAME_W;
+  canvas.height = GAME_H;
+  engine._web_canvas_size(GAME_W, GAME_H);
+
+  if (!engine._web_render_init(engine.stringToNewUTF8("#canvas"))) throw new Error("2D canvas presenter failed to initialize");
+  perf.reset();
+
+  const header = engine._web_audio_ring_create(audio.sampleRate);
+  const node = new AudioWorkletNode(audio, "ring-player", {
+    numberOfInputs: 0,
+    outputChannelCount: [2],
+    processorOptions: { buffer: engine.HEAPU8.buffer, header },
+  });
+  if (params.has("audioTap")) {
+    const analyser = audio.createAnalyser();
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = 0;
+    const streamDest = audio.createMediaStreamDestination();
+    node.connect(streamDest);
+    const streamSrc = audio.createMediaStreamSource(streamDest.stream);
+    streamSrc.connect(analyser);
+    analyser.connect(audio.destination);
+    const ringU32 = new Uint32Array(engine.HEAPU8.buffer);
+    const ringH = header >>> 2;
+    const ringWriteIdx = () => ringU32[ringH] >>> 2;
+    const ringReadIdx = () => ringU32[ringH + 1] >>> 2;
+    const tap: AudioTap = {
+      contextState: () => audio.state,
+      resume: () => audio.resume(),
+      ringDelta: () => {
+        const w = Atomics.load(ringU32, ringWriteIdx());
+        const r = Atomics.load(ringU32, ringReadIdx());
+        return (w - r) >>> 0;
+      },
+      maxPeak: 0,
+      samplePeak() {
+        const buf = new Float32Array(analyser.fftSize);
+        analyser.getFloatTimeDomainData(buf);
+        let peak = 0;
+        for (let i = 0; i < buf.length; i++) peak = Math.max(peak, Math.abs(buf[i]));
+        if (peak > this.maxPeak) this.maxPeak = peak;
+        return peak;
+      },
+    };
+    (window as unknown as { __detectAudio: AudioTap }).__detectAudio = tap;
+  } else {
+    node.connect(audio.destination);
+  }
+  const wakeAudio = () => {
+    if (audio.state !== "running") void audio.resume().catch(() => {});
+  };
+  wakeAudio();
+
+  if (game) {
+    // Hand the translated module and its function list to the engine (instantiated per worker).
+    const ptr = engine._web_game_alloc(game.length);
+    engine.HEAPU8.set(game, ptr);
+    const funcs = functionList(game);
+    const fptr = engine._malloc(funcs.length * 4);
+    new Uint32Array(engine.HEAPU8.buffer, fptr, funcs.length).set(funcs);
+    engine._web_game_register(fptr, funcs.length);
+  }
+
+  const mouseCapture = !params.has("noCapture");
+  canvas.style.cursor = "none";
+  const input = new Input(engine, canvas, { pauseAlias: prefs.pauseAlias, mouseCapture });
+  // F1 or the HUD's Controls button: the controls list. The game is paused meanwhile (as when the
+  // window loses focus) and gets no input.
+  const toggleHelp = () => {
+    if (help.isOpen) return help.hide();
+    input.suspend(true);
+    if (document.pointerLockElement) document.exitPointerLock();
+    const resume = () => {
+      input.suspend(false);
+      canvas.focus();
+    };
+    void help.show("Back to the game (F1)", resume).catch((err: unknown) => log(String(err), true));
+  };
+  input.options.onHelp = toggleHelp;
+  $("help-button").addEventListener("click", toggleHelp);
+  const showHud = attachHud(input);
+
+  // Scripted keys for automated tests: frame:Code[+hold]
+  const script = (params.get("keys") ?? "")
+    .split(",")
+    .filter(Boolean)
+    .map((s) => {
+      const [f, rest] = s.split(":");
+      // `+` arrives as a space when the URL does not escape it.
+      const [code, hold] = rest.split(/[+ ]/);
+      return { frame: Number(f), code, hold: Number(hold ?? 4), down: false, up: false };
+    });
+  const captures = new Set((params.get("capture") ?? "").split(",").filter(Boolean).map(Number));
+
+  let lastScriptFrame = 0;
+  const onPresentedFrame = () => {
+    dev.frames++;
+    if (dev.frames <= 300) wakeAudio();
+    if (dev.frames <= 120) showHud(6000);
+    if (captures.has(dev.frames)) dev.captures[dev.frames] = canvas.toDataURL("image/png");
+    for (const k of script) {
+      const key = KEYS[k.code];
+      if (!key) continue;
+      if (!k.down && dev.frames >= k.frame) {
+        k.down = true;
+        engine._web_key(0, key[0], key[1], 0);
+      } else if (k.down && !k.up && dev.frames >= k.frame + k.hold) {
+        k.up = true;
+        engine._web_key(1, key[0], key[1], 0);
+      }
+    }
+  };
+
+  const tick = () => {
+    const now = performance.now();
+    if (perf.lastRafMs) perf.rafDeltas.push(now - perf.lastRafMs);
+    perf.lastRafMs = now;
+    const fc = engine.__ddrawFrameCounter ?? 0;
+    if (fc > perf.lastDdraw) {
+      perf.guestFlipDeltas.push(fc - perf.lastDdraw);
+      perf.lastDdraw = fc;
+    }
+    const flips = engine.__perfNative?.guestFlips ?? 0;
+    if (flips > perf.lastGuestFlips) {
+      perf.lastGuestFlips = flips;
+    }
+    pads.feed(engine);
+    if (engine._web_render_tick()) perf.presented++;
+    const fcNow = engine.__ddrawFrameCounter ?? 0;
+    if (fcNow > lastScriptFrame) {
+      lastScriptFrame = fcNow;
+      onPresentedFrame();
+    }
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+
+  setState("running", "Running");
+  canvas.focus();
+  // Writable save sidecars: same OPFS tree as `saves.ts` (engine overlay uses `/opfs/saves/`).
+  await navigator.storage.getDirectory().then((d) => d.getDirectoryHandle(SAVES_DIR, { create: true }));
+  if (detectiveInput && engine._web_set_detective_input) {
+    const p = engine.stringToNewUTF8(detectiveInput);
+    engine._web_set_detective_input(p);
+  }
+  // Yield so the first animation frame can run while the engine starts on a worker thread.
+  queueMicrotask(() => engine.callMain([`/opfs/${INSTALL_DIR}`]));
+}
+
+/** The overlay with the fullscreen button and input hints; shown while the mouse moves. */
+function attachHud(input: Input) {
+  const hud = $("hud");
+  const hint = $("hint");
+  const button = $<HTMLButtonElement>("fullscreen");
+  const code = input.options.pauseAlias;
+  const alias = code === "Backquote" ? "` (left of 1)" : keyLabel(code);
+  let timer = 0;
+  const show = (ms: number) => {
+    hud.classList.add("show");
+    clearTimeout(timer);
+    timer = window.setTimeout(() => hud.classList.remove("show"), ms);
+  };
+  const update = () => {
+    const fs = isFullscreen();
+    button.textContent = fs ? "Exit fullscreen" : "Fullscreen";
+    const tips = [];
+    if (input.options.mouseCapture && !input.pointerLocked) tips.push("Click the game to use the mouse.");
+    if (fs && canLockEscape) tips.push("Hold Esc to leave fullscreen.");
+    else if ((fs || input.pointerLocked) && code) tips.push(`Esc is taken by the browser here: press ${alias} for the game's Esc.`);
+    hint.textContent = tips.join(" ");
+  };
+  button.addEventListener("click", () => {
+    void (isFullscreen() ? exitFullscreen() : enterFullscreen($("game"))).catch((err: unknown) =>
+      log(`Fullscreen is not available: ${err instanceof Error ? err.message : String(err)}`, true),
+    );
+    $("canvas").focus();
+  });
+  watchFullscreen(() => {
+    update();
+    show(4000);
+  });
+  document.addEventListener("pointerlockchange", () => {
+    update();
+    if (input.pointerLocked) hud.classList.remove("show");
+    else show(4000);
+  });
+  $("game").addEventListener("mousemove", () => {
+    if (!input.pointerLocked) show(2500);
+  });
+  update();
+  show(6000);
+  return show;
+}
+
+// ---- Save backups ------------------------------------------------------------------------------
+
+const saveStatus = () => $("save-status");
+
+async function refreshSaves() {
+  const saves = await listSaves().catch(() => []);
+  $<HTMLButtonElement>("save-export").disabled = saves.length === 0;
+  if (!saveStatus().dataset.sticky) {
+    saveStatus().textContent = saves.length
+      ? `${saves.length} save ${saves.length === 1 ? "slot" : "slots"} in this browser, last saved ${saves.reduce((a, b) => (a.date > b.date ? a : b)).date.toLocaleString()}.`
+      : "No saved games in this browser yet.";
+  }
+}
+
+function sayAboutSaves(text: string, error = false) {
+  const el = saveStatus();
+  el.textContent = text;
+  el.dataset.sticky = "1";
+  el.classList.toggle("error", error);
+}
+
+function attachSaves() {
+  let pending: ImportPlan | null = null;
+  const confirmBox = $("save-confirm");
+  const fileInput = $<HTMLInputElement>("save-import");
+  // One backup or restore at a time.
+  const busy = (on: boolean) => {
+    for (const id of ["save-export", "save-import", "save-confirm-yes", "save-confirm-no"]) $<HTMLButtonElement>(id).disabled = on;
+    $("save-import-label").style.opacity = on ? "0.5" : "";
+    if (!on) void refreshSaves();
+  };
+  const apply = async (plan: ImportPlan) => {
+    sayAboutSaves("Restoring…");
+    busy(true);
+    try {
+      await applyImport(plan);
+      const names = plan.files.map((f) => f.name);
+      sayAboutSaves(`Restored ${names.join(", ")}.`);
+    } finally {
+      busy(false);
+    }
+  };
+  $("save-export").addEventListener("click", async () => {
+    try {
+      const zip = await exportSaves();
+      if (!zip) return sayAboutSaves("There are no saved games to back up yet.");
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(zip);
+      a.download = `detective-saves-${new Date().toISOString().slice(0, 10)}.zip`;
+      document.body.append(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 60_000);
+      sayAboutSaves(`Downloaded ${a.download}.`);
+    } catch (err) {
+      sayAboutSaves(`Backup failed: ${err instanceof Error ? err.message : String(err)}`, true);
+    }
+  });
+  fileInput.addEventListener("change", async () => {
+    const files = [...(fileInput.files ?? [])];
+    fileInput.value = "";
+    if (!files.length) return;
+    confirmBox.hidden = true;
+    pending = null;
+    sayAboutSaves("Checking the files…");
+    let plan: ImportPlan;
+    busy(true);
+    try {
+      plan = await planImport(files);
+    } catch (err) {
+      sayAboutSaves(`Nothing restored: ${err instanceof Error ? err.message : String(err)}`, true);
+      return;
+    } finally {
+      busy(false);
+    }
+    if (plan.overwrites.length) {
+      pending = plan;
+      $("save-confirm-text").textContent = `This replaces ${plan.overwrites.join(", ")} in this browser. Back up first if you may want them again.`;
+      sayAboutSaves("Waiting for your confirmation.");
+      confirmBox.hidden = false;
+      return;
+    }
+    try {
+      await apply(plan);
+    } catch (err) {
+      sayAboutSaves(`Restore failed: ${err instanceof Error ? err.message : String(err)}`, true);
+    }
+  });
+  $("save-confirm-yes").addEventListener("click", async () => {
+    confirmBox.hidden = true;
+    const plan = pending;
+    pending = null;
+    if (!plan) return;
+    try {
+      await apply(plan);
+    } catch (err) {
+      sayAboutSaves(`Restore failed: ${err instanceof Error ? err.message : String(err)}`, true);
+    }
+  });
+  $("save-confirm-no").addEventListener("click", () => {
+    confirmBox.hidden = true;
+    pending = null;
+    sayAboutSaves("Nothing was changed.");
+  });
+}
+
+// ---- Startup -----------------------------------------------------------------------------------
+
+function probeStorage(): Promise<string> {
+  return new Promise((resolve) => {
+    const worker = new Worker(new URL("./opfs-probe-worker.ts", import.meta.url), { type: "module" });
+    const done = (result: string) => {
+      worker.terminate();
+      resolve(result);
+    };
+    worker.onmessage = (e: MessageEvent<string>) => done(e.data);
+    worker.onerror = (e) => done(`worker failed: ${e.message}`);
+    worker.postMessage(0);
+  });
+}
+
+async function main() {
+  if (!crossOriginIsolated) {
+    setState("error", "This page must be served with cross-origin isolation (COOP/COEP headers).");
+    return;
+  }
+  if (!("storage" in navigator) || !navigator.storage.getDirectory) {
+    setState("error", "This browser does not support the Origin Private File System.");
+    return;
+  }
+  const storage = await probeStorage();
+  if (storage !== "ok") {
+    setState("error", "This window cannot store the game. Private browsing windows do not allow it: open the page in a normal window.");
+    log(`storage check: ${storage}`, true);
+    return;
+  }
+  void navigator.storage.persist?.();
+
+  const showPlay = () => {
+    setState("ready", "Ready.");
+    $("install-panel").hidden = true;
+    $("play-panel").hidden = false;
+    void refreshSaves();
+    if (params.has("autoplay")) void play().catch(fail);
+  };
+  const askInstall = () => {
+    setState("need-install", "No installed copy found in this browser.");
+    $("install-panel").hidden = false;
+    $("play-panel").hidden = true;
+  };
+  const fail = (err: unknown) => {
+    setState("error", "Something went wrong.");
+    log(err instanceof Error ? `${err.message}\n${err.stack ?? ""}` : String(err), true);
+  };
+
+  $<HTMLInputElement>("iso").addEventListener("change", async (e) => {
+    const file = (e.target as HTMLInputElement).files?.[0];
+    if (!file) return;
+    try {
+      await runInstall(file);
+      showPlay();
+    } catch (err) {
+      fail(err);
+    }
+  });
+  // The first start shows the controls first.
+  const startPlay = () => {
+    const t0 = params.has("timing") ? performance.now() : 0;
+    const run = () => {
+      void play()
+        .then(() => {
+          if (t0) dev.playStartMs = Math.round(performance.now() - t0);
+        })
+        .catch(fail);
+    };
+    if (help.seen) return run();
+    void help.show("Play", run).catch(fail);
+  };
+  $("play").addEventListener("click", startPlay);
+  $("controls").addEventListener("click", () => {
+    void help.show().catch(fail);
+  });
+  $("reinstall").addEventListener("click", askInstall);
+  const settingsPanel = new SettingsPanel(prefs);
+  $("settings").addEventListener("click", () => void settingsPanel.open().catch(fail));
+  attachSaves();
+
+  if (await installed()) showPlay();
+  else if (import.meta.env.DEV && params.has("devIso")) {
+    try {
+      setState("downloading", "Fetching the development disc image…");
+      const res = await fetch("/dev-iso");
+      if (!res.ok) throw new Error(`dev-iso HTTP ${res.status}`);
+      // response.blob() fails on this ~370 MiB stream under COEP; arrayBuffer() is reliable.
+      const blob = new Blob([await res.arrayBuffer()]);
+      await runInstall(blob);
+      showPlay();
+    } catch (err) {
+      fail(err);
+    }
+  } else askInstall();
+}
+
+void main();
