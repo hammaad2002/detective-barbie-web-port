@@ -76,7 +76,7 @@ static uint32_t g_sys_next = kSysBase;
 uint32_t sys_alloc(uint32_t size, uint32_t align) {
   std::lock_guard<std::mutex> lock(g_mem_mutex);
   uint32_t a = (g_sys_next + align - 1) & ~(align - 1);
-  if (a + size > kSysEnd) fatal("runtime system area exhausted");
+  if (a + size > kCameraPos) fatal("runtime system area exhausted");
   g_sys_next = a + size;
   memset(host(a), 0, size);
   return a;

@@ -794,13 +794,26 @@ HLE_STDCALL("shell32.dll", SHGetFolderPathA, 5) {
 // themselves "next frame" (now + 1), so walking and animation advance per loop iteration. The loop now
 // runs faster for a smooth cursor (recomp/src/patches.ts), so the object scheduler (0x424c50) called
 // from that loop reads a clock that advances in 62 ms steps: objects run exactly as often as in the
-// original game, while the cursor and presentation keep the fast rate.
+// original game, while the cursor and presentation keep the fast rate. The step is decided at the
+// top of the loop so the camera copy (kCameraPos) stays one step behind Barbie on every frame, as
+// it was in the original; refreshing it on all frames made her jitter forward and back.
 HLE_STDCALL("winmm.dll", timeGetTime, 0) {
   const uint32_t now = now_ms();
+  constexpr uint32_t kWalkLoopTop = 0x004364a6;       // return address of the walk loop's frame-start call
   constexpr uint32_t kSchedulerNowCall = 0x00424c8b;  // return address of the scheduler's timeGetTime
   constexpr uint32_t kWalkLoopCall = 0x0043652e;      // return address of the walk loop's scheduler call
   constexpr uint32_t kSchedulerFrame = 0x134;         // scheduler's own return address, from its call
   constexpr uint32_t kOriginalFrameMs = 62;
+  constexpr uint32_t kBarbiePos = 0x0047fc64;         // object record 0: x, y, z words
+  static uint32_t step_now = 0;
+  if (ld32(c->esp) == kWalkLoopTop) {
+    const uint32_t step = now - now % kOriginalFrameMs;
+    if (step != step_now) {
+      step_now = step;
+      memcpy(host(kCameraPos), host(kBarbiePos), 6);
+    }
+    return now;
+  }
   if (ld32(c->esp) != kSchedulerNowCall || ld32(c->esp + kSchedulerFrame) != kWalkLoopCall) return now;
   // The in-game cursor is an object every area creates with script 0x43dd00. It stores the mouse position
   // in its record and the renderer draws the cursor from there on every pass: keep that position live so
@@ -814,7 +827,7 @@ HLE_STDCALL("winmm.dll", timeGetTime, 0) {
     st16(rec + 0x14, (uint16_t)mx);
     st16(rec + 0x16, (uint16_t)my);
   }
-  return now - now % kOriginalFrameMs;
+  return step_now;
 }
 HLE_STDCALL("winmm.dll", timeBeginPeriod, 1) { return 0; }  // TIMERR_NOERROR
 HLE_STDCALL("winmm.dll", timeEndPeriod, 1) { return 0; }

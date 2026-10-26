@@ -21,6 +21,7 @@ constexpr uint32_t kGranularity = 0x10000;
 constexpr uint32_t kNullGuardEnd = 0x00010000;
 constexpr uint32_t kSysBase = 0x00010000;  // PEB, TEBs, environment, misc runtime structures
 constexpr uint32_t kSysEnd = 0x002F0000;
+constexpr uint32_t kCameraPos = kSysEnd - 0x10;  // walk-loop camera x/y/z words read by patched code (recomp/src/patches.ts)
 constexpr uint32_t kThunkBase = 0x002F0000;  // HLE entry points (imports and COM methods)
 constexpr uint32_t kThunkEnd = 0x00300000;
 constexpr uint32_t kComBase = 0x00300000;  // COM objects and vtables handed to the game

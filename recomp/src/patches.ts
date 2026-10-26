@@ -20,6 +20,13 @@ export const CODE_PATCHES: CodePatch[] = [
   { va: 0x43656f, expect: [0xba, 0x3e, 0, 0, 0], replace: [0xba, 0x0a, 0, 0, 0], why: "walk loop: Sleep(62-elapsed) -> 10" },
   { va: 0x42334e, expect: [0x83, 0xf8, 0x42], replace: [0x83, 0xf8, 0x05], why: "screen loop: cmp elapsed,66 -> 5" },
   { va: 0x423353, expect: [0xba, 0x42, 0, 0, 0], replace: [0xba, 0x05, 0, 0, 0], why: "screen loop: Sleep(66-elapsed) -> 5" },
+  // The walk loop places the camera from Barbie's position before the scheduler moves her. With
+  // logic steps every 62 ms but frames every 10 ms, the camera caught up on in-between frames, so
+  // she jittered one step ahead and back. The camera now reads a copy (kCameraPos in
+  // runtime/src/core/rt.h) that timeGetTime refreshes only on step frames, as in the original.
+  { va: 0x4364a9, expect: [0x66, 0xfc, 0x47, 0], replace: [0xf2, 0xff, 0x2e, 0], why: "walk camera: read y from kCameraPos+2" },
+  { va: 0x4364b0, expect: [0x64, 0xfc, 0x47, 0], replace: [0xf0, 0xff, 0x2e, 0], why: "walk camera: read x from kCameraPos" },
+  { va: 0x4364b9, expect: [0x68, 0xfc, 0x47, 0], replace: [0xf4, 0xff, 0x2e, 0], why: "walk camera: read z from kCameraPos+4" },
   // Menu-screen cursor object (0x43e790) re-arms itself 30 ms ahead, so the pointer moved at ~33 Hz.
   // It only reads the mouse and hit-tests buttons (no animation steps), so 10 ms is safe.
   { va: 0x43ec5b, expect: [0x83, 0xc0, 0x1e], replace: [0x83, 0xc0, 0x05], why: "menu cursor: wake every 30 ms -> 5" },
