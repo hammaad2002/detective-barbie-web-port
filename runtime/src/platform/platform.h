@@ -54,6 +54,9 @@ GamepadState gamepad_state(int slot);
 void gamepad_rumble(int slot, float strong, float weak);
 // Called once per presented frame (drives scripted input: BELLA_INPUT="frame:Key[+hold],...").
 void frame_presented(uint64_t frame);
+// Block until the host display starts its next refresh (at most timeout_ms). Returns false, without
+// waiting, when the host has no display clock to follow (native builds, presenter not running).
+bool wait_display_frame(uint32_t timeout_ms);
 // Blit a composed game frame (little-endian BGRA pixels, w*h uint32_t values) to the host display.
 void present_rgba(const uint32_t* bgra, int w, int h);
 // Web: blit RGBA8 pixels (w*h*4 bytes) to the page canvas.

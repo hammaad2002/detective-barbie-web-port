@@ -9,6 +9,7 @@
 #include <unordered_map>
 
 #include "../core/objects.h"
+#include "../platform/platform.h"
 #include "ddraw.h"
 
 using namespace rt;
@@ -655,6 +656,13 @@ HLE_STDCALL(kDll, Sleep, 1) {
   g_stats[StatSleeps]++;
   ddraw::frame_boundary();
   if (ms > 2000 && ms != 0xffffffffu) log(Log::Warn, "Sleep(%u ms) from %08x", ms, ld32(c->esp));
+  // The walk loop and the menu-screen loop end each frame with a frame-cap Sleep (patched to 10 and
+  // 5 ms, recomp/src/patches.ts). Where the host has a display clock, wait for its next refresh
+  // instead: one evenly spaced frame per refresh. Fixed sleeps put finished frames 10, 20, 20 ms
+  // apart on a 60 Hz display, which made smooth motion stutter.
+  constexpr uint32_t kWalkLoopFrameCap = 0x0043657d, kScreenLoopFrameCap = 0x00423361;
+  const uint32_t ret = ld32(c->esp);
+  if ((ret == kWalkLoopFrameCap || ret == kScreenLoopFrameCap) && plat::wait_display_frame(50)) return 0;
 #if defined(__EMSCRIPTEN__)
   if (ms <= 2) {
     std::this_thread::yield();

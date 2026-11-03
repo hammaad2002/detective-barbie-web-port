@@ -37,6 +37,11 @@ std::deque<Batch> g_queue;
 uint64_t g_submitted = 0, g_executed = 0, g_frames_queued = 0, g_frames_done = 0;
 std::atomic<bool> g_gl{false};
 
+// Animation-frame ticks from the page, for game loops that pace themselves to the display.
+std::mutex g_tick_mutex;
+std::condition_variable g_tick_cv;
+uint64_t g_tick = 0;
+
 std::mutex g_present_mutex;
 std::condition_variable g_present_cv;
 uint64_t g_presented_frame = 0;
@@ -138,6 +143,11 @@ EMSCRIPTEN_KEEPALIVE int web_render_init(const char* canvas_selector) {
 
 // Called every animation frame on the page's main thread: compose at most one new game frame.
 EMSCRIPTEN_KEEPALIVE int web_render_tick() {
+  {
+    std::lock_guard<std::mutex> lock(web::g_tick_mutex);
+    web::g_tick++;
+  }
+  web::g_tick_cv.notify_all();
   const uint64_t fc = ddraw::frame_counter();
   EM_ASM({ Module.__ddrawFrameCounter = $0; }, (double)fc);
   // Game frame statistics for tools/web-fps.mjs: [flips, primaryBlts, cursorPolls, sleeps, locks].
@@ -178,6 +188,17 @@ EMSCRIPTEN_KEEPALIVE int web_render_tick() {
 }
 
 }  // extern "C"
+
+namespace plat {
+bool wait_display_frame(uint32_t timeout_ms) {
+  std::unique_lock<std::mutex> lock(web::g_tick_mutex);
+  const uint64_t start = web::g_tick;
+  if (start == 0) return false;
+  // A hidden tab gets no animation frames: the timeout keeps the game running at a low rate.
+  web::g_tick_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] { return web::g_tick != start; });
+  return true;
+}
+}  // namespace plat
 
 // argv: [install-dir] [registry-file]; the page mounts OPFS before starting the module.
 int main(int argc, char** argv) {

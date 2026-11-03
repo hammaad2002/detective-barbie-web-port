@@ -1024,6 +1024,8 @@ void scripted_pads() {
 }
 }  // namespace
 
+bool wait_display_frame(uint32_t) { return false; }
+
 void frame_presented(uint64_t frame) {
   g_frame = frame;
   rt::note_present();

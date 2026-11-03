@@ -1147,7 +1147,8 @@ void frame_boundary() {
 
 void publish_frame() {
   const auto now = std::chrono::steady_clock::now();
-  if (g_snap_valid && now - g_snap_time < std::chrono::milliseconds(8)) return;  // >120 fps is wasted work
+  // More than 250 snapshots a second is wasted work; display-paced loops stay below that even at 144 Hz.
+  if (g_snap_valid && now - g_snap_time < std::chrono::milliseconds(4)) return;
   int w = 0, h = 0;
   {
     std::lock_guard<std::recursive_mutex> lock(g_dd_mutex);

@@ -89,3 +89,29 @@ scheduler called from the walk loop now reads a clock that advances in the origi
 The cursor object (script 0x43dd00) gets the live mouse position every pass, so the pointer still
 moves at 60 fps. Distance walked per press, original vs now: 0.3 s 88-109 vs 88 px, 0.6 s 199 vs
 199-201 px, 0.9 s 308 vs 312 px.
+
+## Smooth in-game motion and edge cursor (2026-11-02)
+In game, only the cursor moved at 60 fps: Barbie, other objects and the scrolling area still
+changed every 62 ms (16 fps), and the pointer shook at the screen edges.
+
+1. **Edge cursor.** While an area scrolls at the screen edges (signed byte 0x4758f8 < 0), the cursor
+   script 0x43dd00 clamps the pointer to x 30-610, y 30-450 and shows an arrow. The runtime wrote
+   the raw mouse position on the in-between frames, so the pointer alternated between, for example,
+   x=2 and x=30. It now applies the same clamp (runtime/src/hle/smooth.cpp).
+2. **Blended drawing between logic steps.** The scheduler (0x424c50) runs the object scripts and then
+   draws every object from its record. Two stubs patched into alignment padding (0x4247d1,
+   0x4247f1; recomp/src/patches.ts) call timeGetTime just before and just after that draw. Before
+   the draw, each object's x/y/z is blended between the last two logic steps by the time since the
+   newer one, and so is the camera. After it, the true positions are put back, so game logic never
+   reads a blended value. Moves over 48 units in one step are drawn without blending.
+   Everything is shown one step behind the logic, the same Barbie-to-camera delay as the original.
+   Set `DETECTIVE_NO_SMOOTH=1` (native) to compare; `DETECTIVE_SMOOTH_TRACE=1` logs each pass.
+3. **Display-paced frames (web).** A 10 ms frame cap on a 60 Hz display puts finished frames 10, 20,
+   20 ms apart, which shows as stutter once motion is smooth. The frame-cap Sleep of the walk loop
+   and the menu loop now waits for the page's next animation frame (50 ms timeout for hidden tabs),
+   so the game renders one evenly spaced frame per refresh, and the publish limit is 4 ms so
+   120/144 Hz displays are not capped.
+
+Game logic is unchanged: walk distances per press (native) 0.6 s 199 px, 0.9 s 302-310 px, the
+same as before. `tools/web-fps.mjs` has a new `walk` scene that holds the mouse at an edge and
+measures how far the picture scrolls between displayed frames.

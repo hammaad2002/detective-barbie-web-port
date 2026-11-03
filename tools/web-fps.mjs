@@ -80,7 +80,76 @@ SCENES.push(
   { name: "profile", setup: async (page) => { await runEvents(page, ENTRY.slice(0, 1)); await waitFrames(page, 590); } },
   { name: "cutscene", setup: async (page) => { await runEvents(page, ENTRY.slice(1)); await waitFrames(page, 1350); } },
   { name: "in-game", setup: async (page) => { await runEvents(page, PLAY); await waitFrames(page, 3200); } },
+  // Barbie walking while the area scrolls: measured by walkSmoothness() below.
+  { name: "walk", setup: async () => {}, walk: true },
 );
+
+// Hold the mouse at a screen edge so Barbie walks and the area scrolls, and measure how far the
+// picture moves between consecutive animation frames (best horizontal match of two pixel rows).
+// Motion drawn only at the game's 16 Hz logic rate shows up as mostly-zero shifts with jumps.
+async function walkSmoothness(page) {
+  const result = { moving: 0, frames: 0, zeroGaps: 0, meanShift: 0, shiftSd: 0 };
+  for (const edgeX of [637, 2, 637, 2]) {
+    const pt = await gamePoint(page, edgeX, 240);
+    await page.mouse.move(pt.x, pt.y);
+    await page.mouse.down({ button: "left" });
+    const shifts = await page.evaluate(
+      () =>
+        new Promise((resolve) => {
+          const c = document.getElementById("canvas");
+          const ctx = c.getContext("2d", { willReadFrequently: true });
+          const rows = [60, 120, 180];
+          let prev = null, t0 = 0;
+          const out = [];
+          const grab = () => rows.map((y) => ctx.getImageData(0, Math.round((y * c.height) / 480), c.width, 1).data);
+          const step = (t) => {
+            if (!t0) t0 = t;
+            const cur = grab();
+            if (prev) {
+              let best = 0, bestErr = Infinity;
+              const scale = c.width / 640;
+              for (let s = -24; s <= 24; s++) {
+                const off = Math.round(s * scale);
+                let err = 0;
+                for (let r = 0; r < rows.length; r++) {
+                  const a = prev[r], b = cur[r];
+                  for (let x = 40 * scale; x < c.width - 40 * scale; x += 2) {
+                    const i = x * 4, j = (x + off) * 4;
+                    err += Math.abs(a[i] - b[j]) + Math.abs(a[i + 1] - b[j + 1]) + Math.abs(a[i + 2] - b[j + 2]);
+                  }
+                }
+                if (err < bestErr) (bestErr = err), (best = s);
+              }
+              out.push(best);
+            }
+            prev = cur;
+            if (t - t0 < 1500) requestAnimationFrame(step);
+            else resolve(out);
+          };
+          requestAnimationFrame(step);
+        }),
+    );
+    await page.mouse.up({ button: "left" });
+    await page.waitForTimeout(400);
+    // Only the stretch where the picture is scrolling counts (from the first to the last move).
+    const first = shifts.findIndex((s) => s !== 0);
+    let last = -1;
+    for (let i = shifts.length - 1; i >= 0; i--) if (shifts[i] !== 0) { last = i; break; }
+    if (first < 0) continue;
+    const span = shifts.slice(first, last + 1);
+    result.frames += span.length;
+    for (const s of span) if (s === 0) result.zeroGaps++;
+    const moving = span.filter((s) => s !== 0).map(Math.abs);
+    result.moving += moving.length;
+    result.shifts = (result.shifts ?? []).concat(span);
+  }
+  const mv = (result.shifts ?? []).filter((s) => s !== 0).map(Math.abs);
+  if (mv.length) {
+    result.meanShift = mv.reduce((a, b) => a + b, 0) / mv.length;
+    result.shiftSd = Math.sqrt(mv.reduce((a, b) => a + (b - result.meanShift) ** 2, 0) / mv.length);
+  }
+  return result;
+}
 
 function resolveIso(path) {
   const candidates = [path, join(ROOT, path)];
@@ -160,6 +229,14 @@ const gameStats = (page) =>
 async function measureScene(page, scene) {
   await page.evaluate(() => window.__perf?.reset());
   await scene.setup(page);
+  if (scene.walk) {
+    const w = await walkSmoothness(page);
+    console.log(
+      `walk: ${w.frames} frames while scrolling, ${w.zeroGaps} without motion (${((100 * w.zeroGaps) / Math.max(1, w.frames)).toFixed(0)}%), ` +
+        `shift per frame ${w.meanShift.toFixed(1)} px (sd ${w.shiftSd.toFixed(1)})`,
+    );
+    if (process.env.DETECT_WALK_SHIFTS) console.log(`walk shifts: ${(w.shifts ?? []).join(" ")}`);
+  }
   const a = await gameStats(page);
   await new Promise((r) => setTimeout(r, measureSec * 1000));
   const b = await gameStats(page);

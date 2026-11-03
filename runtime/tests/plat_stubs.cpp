@@ -31,6 +31,7 @@ bool has_window() { return false; }
 GamepadState gamepad_state(int) { return {}; }
 void gamepad_rumble(int, float, float) {}
 void frame_presented(uint64_t) {}
+bool wait_display_frame(uint32_t) { return false; }
 bool gl_create_context() { return true; }
 void gl_swap() {}
 void gl_set_swap_interval(int) {}

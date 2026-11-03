@@ -2,10 +2,11 @@
 // bytes: each entry only names an address and the instruction bytes expected there).
 //
 // Frame-rate patches: the game caps its walk loop at 62 ms (16 fps) and its menu/screen loop at
-// 66 ms (15 fps), and draws its own mouse cursor once per loop. Game logic in both loops is
-// scheduled by timeGetTime (objects wake at "now + delay"; walking moves per elapsed ms), so
-// lowering the cap to 10 ms gives a fresh frame for every 60 Hz refresh without changing game speed (verified:
-// identical walk distance per second and identical intro timing; see docs/PERF-NOTES.md).
+// 66 ms (15 fps), and draws its own mouse cursor once per loop. Menu-screen objects wake at
+// "now + delay", so the faster screen loop does not change their speed. In-game objects advance
+// once per walk-loop pass, so the runtime keeps them on the original 62 ms steps and blends what it
+// draws in between (runtime/src/hle/smooth.cpp). On the web both loops then wait for the display's
+// next refresh instead of sleeping (kernel32 Sleep). See docs/PERF-NOTES.md.
 // The ride minigames and the movie player keep their own pacing (their logic is per-frame).
 
 export interface CodePatch {
@@ -14,6 +15,14 @@ export interface CodePatch {
   replace: number[];
   why: string;
 }
+
+/** `call rel32` placed at `at` that targets `to`. */
+function call(at: number, to: number): number[] {
+  const rel = (to - (at + 5)) >>> 0;
+  return [0xe8, rel & 0xff, (rel >>> 8) & 0xff, (rel >>> 16) & 0xff, rel >>> 24];
+}
+/** `call [0x48c530]`: BDETECT.EXE's import slot for winmm!timeGetTime. */
+const callTimeGetTime = [0xff, 0x15, 0x30, 0xc5, 0x48, 0x00];
 
 export const CODE_PATCHES: CodePatch[] = [
   { va: 0x43656a, expect: [0x83, 0xf8, 0x3e], replace: [0x83, 0xf8, 0x0a], why: "walk loop: cmp elapsed,62 -> 10" },
@@ -30,6 +39,25 @@ export const CODE_PATCHES: CodePatch[] = [
   // Menu-screen cursor object (0x43e790) re-arms itself 30 ms ahead, so the pointer moved at ~33 Hz.
   // It only reads the mouse and hit-tests buttons (no animation steps), so 10 ms is safe.
   { va: 0x43ec5b, expect: [0x83, 0xc0, 0x1e], replace: [0x83, 0xc0, 0x05], why: "menu cursor: wake every 30 ms -> 5" },
+  // Smooth motion between the 62 ms logic steps (runtime/src/hle/smooth.cpp). The scheduler runs the
+  // object scripts and then draws every object from its record; two stubs in alignment padding call
+  // timeGetTime right before that draw (records get blended positions) and right after it (true
+  // positions come back before any other code reads them). The runtime recognises the calls by
+  // their return addresses (0x4247dc, 0x4247f7) and leaves every other caller of these paths alone.
+  {
+    va: 0x4247d1,
+    expect: new Array(12).fill(0x90),
+    replace: [...call(0x4247d1, 0x423fc0), ...callTimeGetTime, 0xc3],
+    why: "stub: 0x423fc0, then timeGetTime (before-draw hook), ret",
+  },
+  {
+    va: 0x4247f1,
+    expect: new Array(12).fill(0x90),
+    replace: [...callTimeGetTime, ...call(0x4247f7, 0x430fd0), 0xc3],
+    why: "stub: timeGetTime (after-draw hook), then 0x430fd0, ret",
+  },
+  { va: 0x424ce7, expect: call(0x424ce7, 0x423fc0), replace: call(0x424ce7, 0x4247d1), why: "scheduler: before-draw stub" },
+  { va: 0x436531, expect: call(0x436531, 0x430fd0), replace: call(0x436531, 0x4247f1), why: "walk loop: after-draw stub" },
 ];
 
 /** Apply every patch whose expected bytes are present; other executables are left untouched. */

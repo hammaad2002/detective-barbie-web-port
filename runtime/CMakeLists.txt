@@ -26,6 +26,7 @@ set(RUNTIME_SOURCES
   src/hle/kernel32_files.cpp
   src/hle/advapi32.cpp
   src/hle/user32.cpp
+  src/hle/smooth.cpp
   src/hle/com.cpp
   src/hle/dsound.cpp
   src/audio/mixer.cpp)
